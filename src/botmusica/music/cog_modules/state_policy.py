@@ -134,7 +134,11 @@ class StatePolicyMixin:
         if guild_id in self._loaded_settings:
             return player
 
-        settings = await self.guild_settings_repo.get(guild_id)
+        try:
+            settings = await self.guild_settings_repo.get(guild_id)
+        except Exception:
+            LOGGER.debug("Falha ao carregar guild_settings para guild %s", guild_id, exc_info=True)
+            settings = None
         if settings:
             player.volume = min(max(settings.volume, 0.01), 2.0)
             player.loop_mode = settings.loop_mode if settings.loop_mode in {"off", "track", "queue"} else "off"
@@ -152,12 +156,20 @@ class StatePolicyMixin:
                 domain_whitelist=set(self.default_domain_whitelist),
                 domain_blacklist=set(self.default_domain_blacklist),
             )
-        restored_queue = await self.queue_repo.load(guild_id)
+        try:
+            restored_queue = await self.queue_repo.load(guild_id)
+        except Exception:
+            LOGGER.debug("Falha ao carregar fila persistida para guild %s", guild_id, exc_info=True)
+            restored_queue = []
         if restored_queue and not player.current and player.queue.empty():
             for item in restored_queue:
                 await self.queue_service.enqueue(player, self._track_from_queue_item(item))
             LOGGER.info("Fila restaurada no guild %s com %s item(ns)", guild_id, len(restored_queue))
-        runtime_state = await self.store.get_player_runtime_state(guild_id)
+        try:
+            runtime_state = await self.store.get_player_runtime_state(guild_id)
+        except Exception:
+            LOGGER.debug("Falha ao carregar player_runtime_state para guild %s", guild_id, exc_info=True)
+            runtime_state = None
         if runtime_state:
             try:
                 restored_state = PlayerState(runtime_state.state)

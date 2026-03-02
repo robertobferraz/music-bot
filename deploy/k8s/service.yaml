@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: botmusica-web
+  namespace: botmusica
+spec:
+  selector:
+    app: botmusica
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: health
+      port: 8090
+      targetPort: 8090
+  type: ClusterIP

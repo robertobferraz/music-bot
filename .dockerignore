@@ -1,0 +1,13 @@
+.venv
+__pycache__
+.pytest_cache
+.git
+.gitignore
+*.pyc
+*.pyo
+*.pyd
+*.db
+botmusica.db
+data
+tests
+src/botmusica.egg-info

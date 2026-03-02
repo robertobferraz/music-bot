@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: botmusica
+  namespace: botmusica
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: botmusica
+  template:
+    metadata:
+      labels:
+        app: botmusica
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-postgres
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - until pg_isready -h postgres -p 5432 -U botmusica -d botmusica; do echo waiting postgres; sleep 2; done
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+        - name: wait-lavalink
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - until nc -z lavalink 2333; do echo waiting lavalink; sleep 2; done
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      containers:
+        - name: botmusica
+          image: botmusica:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 8090
+              name: health
+          envFrom:
+            - configMapRef:
+                name: botmusica-config
+            - secretRef:
+                name: botmusica-secret
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 5
+          startupProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: 5
+            failureThreshold: 24
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: botmusica-data

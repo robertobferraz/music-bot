@@ -1,0 +1,33 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: botmusica-alerts
+  namespace: botmusica
+spec:
+  groups:
+    - name: botmusica-k8s
+      rules:
+        - alert: BotmusicaDeploymentUnavailable
+          expr: kube_deployment_status_replicas_available{namespace="botmusica",deployment="botmusica"} < 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "botmusica indisponivel"
+            description: "Deployment botmusica sem replicas disponiveis por mais de 5 minutos."
+        - alert: BotmusicaPodFrequentRestarts
+          expr: increase(kube_pod_container_status_restarts_total{namespace="botmusica",container="botmusica"}[15m]) >= 3
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "botmusica com reinicios frequentes"
+            description: "Container botmusica reiniciou 3+ vezes nos ultimos 15 minutos."
+        - alert: LavalinkDeploymentUnavailable
+          expr: kube_deployment_status_replicas_available{namespace="botmusica",deployment="lavalink"} < 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "lavalink indisponivel"
+            description: "Deployment lavalink sem replicas disponiveis por mais de 5 minutos."

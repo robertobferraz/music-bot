@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: lavalink
+  namespace: botmusica
+spec:
+  selector:
+    app: lavalink
+  ports:
+    - name: lavalink
+      port: 2333
+      targetPort: 2333
+  type: ClusterIP

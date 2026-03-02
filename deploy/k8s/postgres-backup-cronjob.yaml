@@ -1,0 +1,50 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: botmusica
+spec:
+  schedule: "0 3 * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: postgres:16-alpine
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: POSTGRES_HOST
+                  value: postgres
+                - name: POSTGRES_PORT
+                  value: "5432"
+                - name: POSTGRES_DB
+                  value: botmusica
+                - name: POSTGRES_USER
+                  value: botmusica
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: botmusica-secret
+                      key: POSTGRES_PASSWORD
+              command:
+                - sh
+                - -c
+                - |
+                  set -euo pipefail
+                  mkdir -p /backups
+                  stamp="$(date +%Y%m%d_%H%M%S)"
+                  target="/backups/backup_${stamp}.sql"
+                  pg_dump --no-owner --no-privileges -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" > "${target}"
+                  find /backups -type f -name "backup_*.sql" | sort | head -n -14 | xargs -r rm -f
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: botmusica-postgres-backups

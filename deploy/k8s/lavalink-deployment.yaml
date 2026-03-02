@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lavalink
+  namespace: botmusica
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: lavalink
+  template:
+    metadata:
+      labels:
+        app: lavalink
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: lavalink
+          image: ghcr.io/lavalink-devs/lavalink:4
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: _JAVA_OPTIONS
+              value: -Xmx2048M
+            - name: SERVER_PORT
+              value: "2333"
+            - name: YOUTUBE_PLUGIN_VERSION
+              value: "1.18.0"
+            - name: LAVALINK_SERVER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: botmusica-secret
+                  key: LAVALINK_PASSWORD
+          ports:
+            - containerPort: 2333
+              name: lavalink
+          readinessProbe:
+            tcpSocket:
+              port: lavalink
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: lavalink
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 6
+          startupProbe:
+            tcpSocket:
+              port: lavalink
+            periodSeconds: 5
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "1024Mi"
+            limits:
+              cpu: "1000m"
+              memory: "2048Mi"
+          volumeMounts:
+            - name: lavalink-config
+              mountPath: /opt/Lavalink/application.yml
+              subPath: application.yml
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: lavalink-config
+          configMap:
+            name: lavalink-config

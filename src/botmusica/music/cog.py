@@ -397,6 +397,18 @@ class MusicCog(
             max_entries=int(os.getenv("DNS_CACHE_MAX_ENTRIES", "128").strip() or "128"),
         )
         self._http_session: ClientSession | None = None
+        self._bind_direct_app_command_callables()
+
+    def _bind_direct_app_command_callables(self) -> None:
+        # Permite chamada direta em testes de regressao (cog.play(...), cog.search(...)).
+        for name in ("play", "playnext", "search", "queue"):
+            try:
+                current = object.__getattribute__(self, name)
+            except AttributeError:
+                continue
+            if isinstance(current, app_commands.Command):
+                bound = current.callback.__get__(self, type(self))
+                setattr(self, name, bound)
 
     async def cog_load(self) -> None:
         await self.store.initialize()
@@ -1333,7 +1345,13 @@ class MusicCog(
 
     def _set_player_state(self, guild_id: int, state: PlayerState, *, reason: str = "") -> None:
         self.player_state.transition(guild_id, state, reason=reason)
-        self.bot.loop.create_task(self.store.upsert_player_runtime_state(guild_id, state.value, int(time.time())))
+        async def _persist_runtime_state() -> None:
+            try:
+                await self.store.upsert_player_runtime_state(guild_id, state.value, int(time.time()))
+            except Exception:
+                LOGGER.debug("Falha ao persistir player runtime state (guild=%s)", guild_id, exc_info=True)
+
+        self.bot.loop.create_task(_persist_runtime_state())
 
     def _player_state_label(self, guild_id: int) -> str:
         return self.player_state.get(guild_id).state.value

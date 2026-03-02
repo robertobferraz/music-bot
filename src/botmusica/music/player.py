@@ -526,7 +526,13 @@ class MusicService:
                 continue
         return tracks
 
-    def _build_ffmpeg_options(self, audio_filter: str, start_seconds: int) -> dict[str, str]:
+    @staticmethod
+    def _build_ffmpeg_options(
+        audio_filter: str,
+        start_seconds: int,
+        *,
+        hq_audio_enabled: bool = False,
+    ) -> dict[str, str]:
         before_options = BASE_BEFORE_OPTIONS
         if start_seconds > 0:
             before_options = f"{before_options} -ss {start_seconds}"
@@ -534,7 +540,7 @@ class MusicService:
         # Qualidade padrao: force stereo/48k para Discord.
         # Modo HQ usa resampler soxr para reduzir artefatos de transcodificacao.
         filter_chain: list[str] = []
-        if self._hq_audio_enabled:
+        if hq_audio_enabled:
             filter_chain.extend(
                 [
                     "aformat=sample_fmts=s16:channel_layouts=stereo",
@@ -573,7 +579,11 @@ class MusicService:
                 raise RuntimeError("O provedor nao retornou uma URL de stream valida.")
             self._cache_put_stream_url(source_query, stream_url)
 
-        ffmpeg_options = self._build_ffmpeg_options(audio_filter=audio_filter, start_seconds=start_seconds)
+        ffmpeg_options = self._build_ffmpeg_options(
+            audio_filter=audio_filter,
+            start_seconds=start_seconds,
+            hq_audio_enabled=self._hq_audio_enabled,
+        )
         base_source = discord.FFmpegPCMAudio(stream_url, **ffmpeg_options)
         return discord.PCMVolumeTransformer(base_source, volume=volume)
 

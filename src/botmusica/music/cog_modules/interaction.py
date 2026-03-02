@@ -117,8 +117,11 @@ class InteractionResponseMixin:
         payload = self._apply_auto_delete_policy(kwargs, interaction=interaction)
         payload.pop("delete_after", None)
         payload.pop("ephemeral", None)
+        edit_fn = getattr(interaction, "edit_original_response", None)
+        if edit_fn is None:
+            return False
         try:
-            await interaction.edit_original_response(**payload)
+            await edit_fn(**payload)
             return True
         except discord.NotFound:
             LOGGER.warning("Interaction expirada antes de editar resposta (cid=%s)", self._correlation_id(interaction))

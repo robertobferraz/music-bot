@@ -544,11 +544,14 @@ class DiscoveryCacheMixin:
         self.nowplaying.cancel_updater(guild_id)
 
     async def _restore_nowplaying_message_if_needed(self, guild_id: int) -> None:
-        await self.nowplaying.restore_message_if_needed(
-            guild_id=guild_id,
-            bot=self.bot,
-            store=self.store,
-        )
+        try:
+            await self.nowplaying.restore_message_if_needed(
+                guild_id=guild_id,
+                bot=self.bot,
+                store=self.store,
+            )
+        except Exception:
+            LOGGER.debug("Falha ao restaurar nowplaying para guild %s", guild_id, exc_info=True)
 
     async def _upsert_nowplaying_message(
         self,

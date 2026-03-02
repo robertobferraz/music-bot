@@ -189,10 +189,6 @@ kubectl -n botmusica port-forward svc/botmusica-web 8080:8080
 - `Backend postgres requer psycopg[binary]`: `pip install -e .[postgres]`
 - Falha de busca YouTube: revisar `YTDLP_JS_RUNTIME` e `YTDLP_REMOTE_COMPONENTS`
 
-## Notas para publicar no GitHub
-- Não versionar `.env`, `data/`, `*.db`, `__pycache__`, `*.pyc`
-- Revisar segredos em manifests e scripts antes do push
-- Manter `.env.example` como referência pública
 
 ## License
 Este projeto está licenciado sob **MIT** (`MIT`).

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import random
 import shutil
@@ -13,6 +14,7 @@ from urllib.parse import urlunparse
 
 import discord
 import yt_dlp
+from yt_dlp.networking.common import NoSupportingHandlers
 
 YTDL_OPTIONS: dict[str, Any] = {
     "format": "bestaudio[acodec^=opus]/bestaudio[ext=webm]/bestaudio/best",
@@ -36,6 +38,8 @@ FILTERS: dict[str, str] = {
     "vaporwave": "asetrate=48000*0.8,aresample=48000,atempo=1.0",
     "karaoke": "pan=stereo|c0=c0-c1|c1=c1-c0",
 }
+
+LOGGER = logging.getLogger("botmusica.music")
 
 
 @dataclass(slots=True)
@@ -70,6 +74,7 @@ class GuildPlayer:
         self.paused_accumulated_seconds: float = 0.0
         self.pending_seek_seconds: int = 0
         self.suppress_after_playback: bool = False
+        self.recovery_requeued_current: bool = False
 
     async def enqueue(self, track: Track) -> None:
         await self.queue.put(track)
@@ -374,6 +379,67 @@ class MusicService:
         return "other"
 
     @staticmethod
+    def _looks_like_http_url(value: str) -> bool:
+        raw = value.strip()
+        return raw.startswith("http://") or raw.startswith("https://")
+
+    @classmethod
+    def _extract_youtube_video_id(cls, value: str) -> str | None:
+        raw = cls._canonicalize_query_url(value)
+        if not cls._looks_like_http_url(raw):
+            return None
+        try:
+            parsed = urlparse(raw)
+        except ValueError:
+            return None
+        host = (parsed.hostname or "").casefold()
+        if host in {"youtu.be"}:
+            video_id = parsed.path.strip("/").strip()
+            return video_id or None
+        if host not in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}:
+            return None
+        video_ids = parse_qs(parsed.query).get("v") or []
+        if not video_ids:
+            return None
+        video_id = video_ids[0].strip()
+        return video_id or None
+
+    @classmethod
+    def _audio_source_queries(cls, track: Track) -> list[str]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: str | None) -> None:
+            raw = cls._canonicalize_query_url(value or "")
+            if not raw or raw in seen:
+                return
+            seen.add(raw)
+            candidates.append(raw)
+
+        add(track.webpage_url)
+        add(track.source_query)
+
+        for value in (track.webpage_url, track.source_query):
+            video_id = cls._extract_youtube_video_id(value)
+            if video_id:
+                add(f"https://www.youtube.com/watch?v={video_id}")
+
+        if not candidates:
+            add(track.source_query)
+        return candidates
+
+    @staticmethod
+    def classify_audio_source_error(exc: Exception) -> str:
+        message = str(exc).strip()
+        if message.startswith("ffmpeg_no_supporting_handlers:"):
+            return "ffmpeg_no_supporting_handlers"
+        if message.startswith("ffmpeg_prepare_error:"):
+            return "ffmpeg_prepare_error"
+        if isinstance(exc, NoSupportingHandlers) or exc.__class__.__name__ == "NoSupportingHandlers":
+            return "ffmpeg_no_supporting_handlers"
+        return "ffmpeg_prepare_error"
+
+    @staticmethod
     def _extract_entry(data: dict[str, Any]) -> dict[str, Any]:
         if "entries" not in data:
             return data
@@ -565,25 +631,71 @@ class MusicService:
         audio_filter: str,
         start_seconds: int = 0,
     ) -> discord.AudioSource:
-        source_query = self._canonicalize_query_url(track.source_query)
-        stream_url = self._cache_get_stream_url(source_query)
-        if not stream_url:
-            data = await self._extract_info_with_retry(
-                self._ytdl,
-                source_query,
-                cache_key=f"stream:{source_query}",
-            )
-            data = self._extract_entry(data)
-            stream_url = data.get("url")
-            if not stream_url:
-                raise RuntimeError("O provedor nao retornou uma URL de stream valida.")
-            self._cache_put_stream_url(source_query, stream_url)
+        source_queries = self._audio_source_queries(track)
+        LOGGER.info(
+            "FFmpeg source prepare title=%r source_query=%r webpage_url=%r candidates=%s",
+            track.title,
+            track.source_query,
+            track.webpage_url,
+            source_queries,
+        )
+        stream_url: str | None = None
+        selected_query: str | None = None
+        last_error: Exception | None = None
+
+        for index, source_query in enumerate(source_queries, start=1):
+            stream_url = self._cache_get_stream_url(source_query)
+            if stream_url:
+                selected_query = source_query
+                LOGGER.info("FFmpeg source cache hit query=%r candidate=%s/%s", source_query, index, len(source_queries))
+                break
+            try:
+                LOGGER.info(
+                    "FFmpeg source extract query=%r provider=%s candidate=%s/%s",
+                    source_query,
+                    self._provider_key_from_query(source_query),
+                    index,
+                    len(source_queries),
+                )
+                data = await self._extract_info_with_retry(
+                    self._ytdl,
+                    source_query,
+                    cache_key=f"stream:{source_query}",
+                )
+                data = self._extract_entry(data)
+                stream_url = data.get("url")
+                if not stream_url:
+                    raise RuntimeError("O provedor nao retornou uma URL de stream valida.")
+                selected_query = source_query
+                self._cache_put_stream_url(source_query, stream_url)
+                break
+            except Exception as exc:
+                last_error = exc
+                error_code = self.classify_audio_source_error(exc)
+                LOGGER.warning(
+                    "FFmpeg source extract failed code=%s query=%r candidate=%s/%s type=%s",
+                    error_code,
+                    source_query,
+                    index,
+                    len(source_queries),
+                    exc.__class__.__name__,
+                    exc_info=True,
+                )
+                if error_code != "ffmpeg_no_supporting_handlers":
+                    break
+
+        if not stream_url or not selected_query:
+            if last_error is not None:
+                error_code = self.classify_audio_source_error(last_error)
+                raise RuntimeError(f"{error_code}: {last_error}") from last_error
+            raise RuntimeError("ffmpeg_prepare_error: Nao foi possivel resolver a URL de stream.")
 
         ffmpeg_options = self._build_ffmpeg_options(
             audio_filter=audio_filter,
             start_seconds=start_seconds,
             hq_audio_enabled=self._hq_audio_enabled,
         )
+        LOGGER.info("FFmpeg source ready query=%r start_seconds=%s filter=%s", selected_query, start_seconds, audio_filter)
         base_source = discord.FFmpegPCMAudio(stream_url, **ffmpeg_options)
         return discord.PCMVolumeTransformer(base_source, volume=volume)
 

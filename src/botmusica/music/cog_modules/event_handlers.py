@@ -137,6 +137,36 @@ class EventHandlersMixin:
         player = await self._get_player(guild.id)
         channel_id = self._last_text_channel_id.get(guild.id)
         text_channel = guild.get_channel(channel_id) if channel_id else None
+        current = player.current
+        if current is not None:
+            self._mark_track_ffmpeg_fallback(guild.id, current)
+            self.queue_service.enqueue_front(player, current)
+            player.current = None
+            player.current_started_at = None
+            player.pause_started_at = None
+            player.paused_accumulated_seconds = 0.0
+            player.suppress_after_playback = False
+            player.recovery_requeued_current = False
+            try:
+                player.queue.task_done()
+            except ValueError:
+                pass
+            await self._persist_queue_state(guild.id, player)
+            LOGGER.warning(
+                "Lavalink track exception guild=%s title=%r message=%s. Reenfileirando para fallback FFmpeg.",
+                guild.id,
+                current.title,
+                message,
+            )
+            switched = await self._switch_voice_to_ffmpeg(guild, player_obj)
+            if switched is not None:
+                if text_channel:
+                    await self._send_channel(
+                        text_channel,
+                        self._warn(f"Lavalink falhou nesta faixa. Aplicando fallback FFmpeg: `{message}`"),
+                    )
+                await self._start_next_if_needed(guild, text_channel)
+                return
         await self._apply_track_finished_state(
             guild,
             player,

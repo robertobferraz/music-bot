@@ -1076,8 +1076,15 @@ class MusicCog(
     def _lavalink_play_identifier(track: Track) -> str:
         source = (track.source_query or "").strip()
         lowered = source.casefold()
+        if lowered.startswith(("ytmsearch:", "ytsearch:", "scsearch:")):
+            return source
         if "open.spotify.com" in lowered or "music.apple.com" in lowered:
-            terms = f"{track.title} {track.artist or ''}".strip()
+            raw_title = (track.title or "").strip()
+            title_lowered = raw_title.casefold()
+            if title_lowered.startswith(("ytmsearch:", "ytsearch:", "scsearch:")):
+                terms = raw_title.split(":", 1)[1].strip()
+            else:
+                terms = f"{raw_title} {track.artist or ''}".strip()
             if terms:
                 return f"ytmsearch:{terms} audio"
         return source or track.webpage_url or track.title

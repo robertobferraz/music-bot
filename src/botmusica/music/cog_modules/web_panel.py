@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 import discord
 from aiohttp import web
+from discord.errors import DiscordException, Forbidden, HTTPException, NotFound
 
 from botmusica.music.player import FILTERS
 from botmusica.music.services.web_auth import (
@@ -58,13 +59,97 @@ class WebPanelMixin:
             and self.web_panel_session_secret
         )
         session_cookie_name = "bm_panel_session"
+        role_cache_ttl_seconds = 120.0
+        role_cache: dict[int, tuple[str, float]] = {}
 
-        def role_for_user(user_id: int) -> str:
-            if user_id in self.web_panel_admin_user_ids:
+        async def role_for_user(user_id: int) -> str:
+            admin_match = user_id in self.web_panel_admin_user_ids
+            dj_match = user_id in self.web_panel_dj_user_ids
+            if admin_match:
+                LOGGER.info(
+                    "Painel web role resolve uid=%s role=admin source=config admin_match=%s dj_match=%s",
+                    user_id,
+                    admin_match,
+                    dj_match,
+                )
                 return "admin"
-            if user_id in self.web_panel_dj_user_ids:
+            if dj_match:
+                LOGGER.info(
+                    "Painel web role resolve uid=%s role=dj source=config admin_match=%s dj_match=%s",
+                    user_id,
+                    admin_match,
+                    dj_match,
+                )
                 return "dj"
-            return "viewer"
+            cached = role_cache.get(user_id)
+            now = time.monotonic()
+            if cached and cached[1] > now:
+                LOGGER.info(
+                    "Painel web role resolve uid=%s role=%s source=cache admin_match=%s dj_match=%s",
+                    user_id,
+                    cached[0],
+                    admin_match,
+                    dj_match,
+                )
+                return cached[0]
+            resolved = "viewer"
+            permission_source = "none"
+            for guild in self.bot.guilds:
+                member = guild.get_member(user_id)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(user_id)
+                    except (NotFound, Forbidden):
+                        continue
+                    except (HTTPException, DiscordException):
+                        LOGGER.debug(
+                            "Falha ao resolver membro %s no guild %s para auth do painel.",
+                            user_id,
+                            guild.id,
+                            exc_info=True,
+                        )
+                        continue
+                permissions = member.guild_permissions
+                if permissions.administrator:
+                    resolved = "admin"
+                    permission_source = f"guild:{guild.id}:administrator"
+                    break
+                if permissions.manage_channels:
+                    resolved = "dj"
+                    permission_source = f"guild:{guild.id}:manage_channels"
+            role_cache[user_id] = (resolved, now + role_cache_ttl_seconds)
+            LOGGER.info(
+                "Painel web role resolve uid=%s role=%s source=%s admin_match=%s dj_match=%s",
+                user_id,
+                resolved,
+                permission_source,
+                admin_match,
+                dj_match,
+            )
+            return resolved
+
+        async def resolve_identity(request: web.Request) -> tuple[str, int | None, str]:
+            if validate_admin_token(request, self.web_panel_admin_token):
+                LOGGER.info("Painel web identity source=token role=admin")
+                return "admin", None, "token"
+            if not oauth_enabled:
+                LOGGER.info("Painel web identity source=none role=viewer oauth_enabled=false")
+                return "viewer", None, "none"
+            raw_cookie = request.cookies.get(session_cookie_name, "")
+            if not raw_cookie:
+                LOGGER.info("Painel web identity source=oauth_missing role=viewer")
+                return "viewer", None, "oauth_missing"
+            session_data = parse_signed_session_cookie(self.web_panel_session_secret, raw_cookie)
+            if not session_data:
+                LOGGER.info("Painel web identity source=oauth_invalid role=viewer reason=session_invalid")
+                return "viewer", None, "oauth_invalid"
+            uid = int(session_data.get("uid", 0) or 0)
+            if uid <= 0:
+                LOGGER.info("Painel web identity source=oauth_invalid role=viewer reason=uid_invalid")
+                return "viewer", None, "oauth_invalid"
+            role = await role_for_user(uid)
+            LOGGER.info("Painel web identity source=oauth uid=%s role=%s", uid, role)
+            return role, uid, "oauth"
 
         def allowed_for_role(role: str, action: str) -> bool:
             admin_only = {
@@ -107,28 +192,20 @@ class WebPanelMixin:
                 return role in {"admin", "dj"}
             return False
 
-        def resolve_identity(request: web.Request) -> tuple[str, int | None, str]:
-            if validate_admin_token(request, self.web_panel_admin_token):
-                return "admin", None, "token"
-            if not oauth_enabled:
-                return "viewer", None, "none"
-            raw_cookie = request.cookies.get(session_cookie_name, "")
-            if not raw_cookie:
-                return "viewer", None, "oauth_missing"
-            session_data = parse_signed_session_cookie(self.web_panel_session_secret, raw_cookie)
-            if not session_data:
-                return "viewer", None, "oauth_invalid"
-            uid = int(session_data.get("uid", 0) or 0)
-            if uid <= 0:
-                return "viewer", None, "oauth_invalid"
-            return role_for_user(uid), uid, "oauth"
-
         async def health(_request: web.Request) -> web.Response:
             return web.json_response({"ok": True})
 
         async def auth_me(request: web.Request) -> web.Response:
-            role, user_id, source = resolve_identity(request)
+            role, user_id, source = await resolve_identity(request)
             authed = role in {"admin", "dj"} if oauth_enabled else bool(self.web_panel_admin_token)
+            LOGGER.info(
+                "Painel web /auth/me uid=%s role=%s source=%s authenticated=%s oauth_enabled=%s",
+                user_id,
+                role,
+                source,
+                authed,
+                oauth_enabled,
+            )
             return web.json_response(
                 {
                     "ok": True,
@@ -199,6 +276,15 @@ class WebPanelMixin:
             uid = int(str(me_payload.get("id") or "0"))
             if uid <= 0:
                 return web.Response(text="Usuario invalido.", status=401)
+            resolved_role = await role_for_user(uid)
+            LOGGER.info(
+                "Painel web OAuth callback uid=%s username=%s role=%s admin_ids=%s dj_ids=%s",
+                uid,
+                str(me_payload.get("username") or "discord-user"),
+                resolved_role,
+                sorted(self.web_panel_admin_user_ids),
+                sorted(self.web_panel_dj_user_ids),
+            )
 
             cookie = create_signed_session_cookie(
                 secret=self.web_panel_session_secret,
@@ -273,7 +359,7 @@ class WebPanelMixin:
             return web.Response(text="\n".join(lines) + "\n", content_type="text/plain")
 
         async def api_status(request: web.Request) -> web.Response:
-            role, user_id, source = resolve_identity(request)
+            role, user_id, source = await resolve_identity(request)
             guilds: list[dict[str, Any]] = []
             for guild in self.bot.guilds:
                 player = await self._get_player(guild.id)
@@ -378,7 +464,7 @@ class WebPanelMixin:
                 return web.json_response({"ok": False, "error": "invalid_payload"}, status=400)
 
             action = str(payload.get("action") or "").strip().casefold()
-            role, _user_id, _source = resolve_identity(request)
+            role, _user_id, _source = await resolve_identity(request)
             if not allowed_for_role(role, action):
                 return web.json_response({"ok": False, "error": "forbidden"}, status=403)
 

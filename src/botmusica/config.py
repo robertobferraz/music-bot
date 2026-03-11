@@ -249,8 +249,8 @@ def load_settings() -> Settings:
     if search_autocomplete_limit > 25:
         search_autocomplete_limit = 25
 
-    delete_after_raw = os.getenv("PUBLIC_MESSAGE_DELETE_AFTER_SECONDS", "30").strip()
-    public_message_delete_after_seconds = float(delete_after_raw) if delete_after_raw else 30.0
+    delete_after_raw = os.getenv("PUBLIC_MESSAGE_DELETE_AFTER_SECONDS", "60").strip()
+    public_message_delete_after_seconds = float(delete_after_raw) if delete_after_raw else 60.0
     if public_message_delete_after_seconds < 0:
         public_message_delete_after_seconds = 0.0
 

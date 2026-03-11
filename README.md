@@ -65,7 +65,7 @@ POSTGRES_DSN=postgresql://usuario:senha@host:5432/botmusica
 Para reprodução com Lavalink:
 
 ```env
-LAVALINK_ENABLED=true
+LAVALINK_ENABLED=false
 LAVALINK_HOST=lavalink
 LAVALINK_PORT=2333
 LAVALINK_PASSWORD=sua_senha

@@ -172,6 +172,8 @@ class MusicCog(
         self._control_room_operator: dict[int, int] = {}
         self._control_room_action_locks: dict[int, asyncio.Lock] = {}
         self._control_room_status_tasks: dict[int, asyncio.Task[None]] = {}
+        self._control_room_bootstrap_task: asyncio.Task[None] | None = None
+        self._control_room_maintenance: set[int] = set()
         self._control_room_history: dict[int, deque[str]] = defaultdict(lambda: deque(maxlen=12))
         self._control_room_preset_cursor: dict[int, int] = {}
         self._voice_mini_panel_state: dict[int, tuple[int, int]] = {}
@@ -288,7 +290,7 @@ class MusicCog(
             self.smart_prefetch_count = 1
         if self.smart_prefetch_count > 4:
             self.smart_prefetch_count = 4
-        self.public_message_delete_after_seconds = float(getattr(bot, "public_message_delete_after_seconds", 30.0))
+        self.public_message_delete_after_seconds = float(getattr(bot, "public_message_delete_after_seconds", 60.0))
         auto_delete_exempt_raw = os.getenv(
             "AUTO_DELETE_EXEMPT_COMMANDS",
             "help,metrics,diagnostics,diagnostico,settings,cache,queue_events",
@@ -324,6 +326,9 @@ class MusicCog(
         }
         self.control_room_status_interval_seconds = float(
             os.getenv("CONTROL_ROOM_STATUS_INTERVAL_SECONDS", "7").strip() or "7"
+        )
+        self.control_room_default_channel_name = (
+            os.getenv("CONTROL_ROOM_CHANNEL_NAME", "bot-controle").strip() or "bot-controle"
         )
         if self.control_room_status_interval_seconds < 2.0:
             self.control_room_status_interval_seconds = 2.0
@@ -420,7 +425,7 @@ class MusicCog(
         self._retention_task = self.bot.loop.create_task(self._retention_worker())
         if self.lavalink_enabled:
             if wavelink is None:
-                LOGGER.warning("LAVALINK_ENABLED=true, mas dependencia `wavelink` nao esta instalada. Usando fallback FFmpeg.")
+                LOGGER.warning("LAVALINK_ENABLED=false, mas dependencia `wavelink` nao esta instalada. Usando fallback FFmpeg.")
                 self.lavalink_enabled = False
             else:
                 connected = await self._connect_lavalink_with_retry()
@@ -434,6 +439,7 @@ class MusicCog(
             except Exception:
                 LOGGER.exception("Falha ao iniciar endpoint de healthcheck HTTP.")
         await self._restore_control_room_panels()
+        self._control_room_bootstrap_task = self.bot.loop.create_task(self._bootstrap_control_rooms_on_ready())
 
     def cog_unload(self) -> None:
         for guild_id in list(self._idle_tasks):
@@ -452,6 +458,9 @@ class MusicCog(
             if not task.done():
                 task.cancel()
             self._control_room_status_tasks.pop(guild_id, None)
+        if self._control_room_bootstrap_task and not self._control_room_bootstrap_task.done():
+            self._control_room_bootstrap_task.cancel()
+            self._control_room_bootstrap_task = None
         if self._startup_warmup_task and not self._startup_warmup_task.done():
             self._startup_warmup_task.cancel()
             self._startup_warmup_task = None
@@ -784,6 +793,17 @@ class MusicCog(
         lowered = raw.casefold()
         return "list=" in lowered or "/playlist" in lowered
 
+    def _playlist_has_pending_items(self, *, query: str, batch: TrackBatch, extraction_limit: int | None) -> bool:
+        if batch.total_items > len(batch.tracks):
+            return True
+        # Alguns extractors nao retornam `playlist_count` quando usamos `playlist_items=1-N`.
+        # Nesse caso, se batemos o limite parcial em uma query de playlist, assumimos que ha mais itens.
+        if extraction_limit is None or extraction_limit <= 0:
+            return False
+        if not self._looks_like_playlist_query(query):
+            return False
+        return len(batch.tracks) >= extraction_limit
+
     async def _enqueue_tracks_incrementally(
         self,
         guild: discord.Guild,
@@ -1077,7 +1097,9 @@ class MusicCog(
         source = (track.source_query or "").strip()
         lowered = source.casefold()
         if lowered.startswith(("ytmsearch:", "ytsearch:", "scsearch:")):
-            return source
+            _, _, terms = source.partition(":")
+            terms = terms.strip()
+            return terms or source
         if "open.spotify.com" in lowered or "music.apple.com" in lowered:
             raw_title = (track.title or "").strip()
             title_lowered = raw_title.casefold()
@@ -1086,7 +1108,7 @@ class MusicCog(
             else:
                 terms = f"{raw_title} {track.artist or ''}".strip()
             if terms:
-                return f"ytmsearch:{terms} audio"
+                return f"{terms} audio"
         return source or track.webpage_url or track.title
 
     async def _prefetch_lavalink_playables(self, tracks: list[Track]) -> None:
@@ -1408,9 +1430,8 @@ class MusicCog(
         if not self.lavalink_enabled or wavelink is None:
             return []
         lowered = query.casefold()
-        # Lavalink nao suporta URL Spotify/Apple Music diretamente.
-        # Evita tentativa invalida para cair direto no resolver/fallback.
-        if "open.spotify.com" in lowered or "music.apple.com" in lowered:
+        if "open.spotify.com" in lowered or "music.apple.com" in lowered or "deezer.com" in lowered:
+            # Para esses catalogos, usamos o resolver/fallback para evitar URL direta cair em FFmpeg/DRM.
             return []
         if not self._provider_available("lavalink_search"):
             return []

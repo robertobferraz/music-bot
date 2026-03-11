@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 from botmusica.music.cog import MusicCog
@@ -62,6 +63,7 @@ def test_recover_playback_after_reconnect_requeues_current_track() -> None:
         cog._is_voice_connected = lambda _vc: True  # type: ignore[method-assign]
         cog._is_voice_playing = lambda _vc: False  # type: ignore[method-assign]
         cog._is_voice_paused = lambda _vc: False  # type: ignore[method-assign]
+        cog.feature_flags = replace(cog.feature_flags, reconnect_strategy_enabled=False)
 
         recovered = await cog._recover_playback_after_reconnect(guild, None)
         assert recovered is True
@@ -212,9 +214,9 @@ def test_resolver_spotify_playlist_converts_all_items_to_search_queries() -> Non
         assert used_spotify is True
         assert batch.total_items == 2
         assert len(batch.tracks) == 2
-        assert batch.tracks[0].source_query.startswith("ytmsearch:")
+        assert batch.tracks[0].source_query.startswith("ytsearch1:")
         assert batch.tracks[0].title == "Musica A"
-        assert batch.tracks[1].source_query.startswith("ytmsearch:")
+        assert batch.tracks[1].source_query.startswith("ytsearch1:")
         assert batch.tracks[1].title == "Musica B"
         await resolver.close()
 
@@ -391,6 +393,63 @@ def test_search_command_e2e_loading_then_edit() -> None:
         assert interaction.edited == 1
 
     asyncio.run(_run())
+
+
+def test_playlist_pending_detects_partial_extraction_without_playlist_count() -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        cog = _build_cog(loop)
+        batch = TrackBatch(
+            tracks=[
+                Track(
+                    source_query=f"ytsearch:track-{index}",
+                    title=f"track-{index}",
+                    webpage_url=f"https://example.com/{index}",
+                    requested_by="tester",
+                )
+                for index in range(10)
+            ],
+            total_items=10,
+            invalid_items=0,
+        )
+        assert (
+            cog._playlist_has_pending_items(
+                query="https://www.youtube.com/playlist?list=PL123",
+                batch=batch,
+                extraction_limit=10,
+            )
+            is True
+        )
+    finally:
+        loop.close()
+
+
+def test_playlist_pending_ignores_non_playlist_queries() -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        cog = _build_cog(loop)
+        batch = TrackBatch(
+            tracks=[
+                Track(
+                    source_query="ytsearch:single",
+                    title="single",
+                    webpage_url="https://example.com/single",
+                    requested_by="tester",
+                )
+            ],
+            total_items=1,
+            invalid_items=0,
+        )
+        assert (
+            cog._playlist_has_pending_items(
+                query="https://www.youtube.com/watch?v=abc",
+                batch=batch,
+                extraction_limit=10,
+            )
+            is False
+        )
+    finally:
+        loop.close()
 
 
 def test_play_command_e2e_enqueues_and_starts() -> None:

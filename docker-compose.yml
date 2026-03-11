@@ -48,6 +48,11 @@ services:
       SERVER_PORT: "2333"
       LAVALINK_SERVER_PASSWORD: "${LAVALINK_PASSWORD}"
       YOUTUBE_PLUGIN_VERSION: "1.18.0"
+      SPOTIFY_CLIENT_ID: "${SPOTIFY_CLIENT_ID:-}"
+      SPOTIFY_CLIENT_SECRET: "${SPOTIFY_CLIENT_SECRET:-}"
+      SPOTIFY_SP_DC: "${SPOTIFY_SP_DC:-}"
+      SPOTIFY_COUNTRY_CODE: "${SPOTIFY_COUNTRY_CODE:-US}"
+      SPOTIFY_CUSTOM_TOKEN_ENDPOINT: "${SPOTIFY_CUSTOM_TOKEN_ENDPOINT:-http://spotify-tokener:7080/api/token}"
     volumes:
       - ./deploy/lavalink/application.yml:/opt/Lavalink/application.yml:ro
     ports:

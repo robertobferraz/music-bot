@@ -372,7 +372,7 @@ class MusicService:
     @staticmethod
     def _provider_key_from_query(query: str) -> str:
         value = (query or "").casefold()
-        if "youtube.com" in value or "youtu.be" in value or value.startswith("ytsearch"):
+        if "youtube.com" in value or "youtu.be" in value or value.startswith(("ytsearch", "ytmsearch", "scsearch")):
             return "youtube"
         if "spotify.com" in value:
             return "spotify"
@@ -416,8 +416,10 @@ class MusicService:
             seen.add(raw)
             candidates.append(raw)
 
-        add(track.webpage_url)
+        # Prioriza source_query porque ele pode ter sido convertido para fallback seguro
+        # (ex.: Spotify -> ytsearch), enquanto webpage_url pode manter o link de catalogo.
         add(track.source_query)
+        add(track.webpage_url)
 
         for value in (track.webpage_url, track.source_query):
             video_id = cls._extract_youtube_video_id(value)

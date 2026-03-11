@@ -14,7 +14,13 @@ fi
 
 extract_env_value() {
   local key="$1"
-  grep -E "^${key}=" .env | tail -n 1 | sed -E "s/^${key}=//" || true
+  local raw
+  raw="$(grep -E "^${key}=" .env | tail -n 1 | sed -E "s/^${key}=//" || true)"
+  raw="$(printf '%s' "$raw" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  if [[ "$raw" =~ ^\".*\"$ || "$raw" =~ ^\'.*\'$ ]]; then
+    raw="${raw:1:${#raw}-2}"
+  fi
+  printf '%s' "$raw"
 }
 
 required_vars=(

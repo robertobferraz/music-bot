@@ -20,6 +20,79 @@ LOGGER = logging.getLogger("botmusica.music")
 
 
 class AdminCommandsMixin:
+    async def _cleanup_legacy_control_room_channels(self, guild: discord.Guild, *, keep_channel_id: int) -> int:
+        removed = 0
+        legacy_name = "bot-controle"
+        current_default = str(getattr(self, "control_room_default_channel_name", legacy_name)).strip().casefold()
+        if current_default == legacy_name:
+            return 0
+        bot_member = guild.me or guild.get_member(getattr(getattr(self.bot, "user", None), "id", 0))
+        if bot_member is None or not bot_member.guild_permissions.manage_channels:
+            return 0
+        for channel in list(guild.text_channels):
+            if channel.id == keep_channel_id:
+                continue
+            if channel.name.strip().casefold() != legacy_name:
+                continue
+            try:
+                await channel.delete(reason="Remocao automatica de canal legado control_room")
+                removed += 1
+            except Exception:
+                continue
+        return removed
+
+    async def _clear_control_room_channel_history(self, channel: discord.TextChannel) -> int:
+        deleted = 0
+        # Remove mensagens antigas uma a uma para garantir limpeza completa do historico.
+        while True:
+            batch: list[discord.Message] = []
+            try:
+                async for message in channel.history(limit=100):
+                    batch.append(message)
+            except Exception:
+                break
+            if not batch:
+                break
+            for message in batch:
+                try:
+                    await message.delete()
+                    deleted += 1
+                except discord.Forbidden:
+                    continue
+                except discord.NotFound:
+                    continue
+                except Exception:
+                    continue
+        return deleted
+
+    async def _bootstrap_control_rooms_on_ready(self) -> None:
+        await self.bot.wait_until_ready()
+        # Aguarda cache de guilds estabilizar apos reconnect/startup.
+        await asyncio.sleep(1.0)
+        for guild in list(self.bot.guilds):
+            try:
+                result = await self._provision_control_room(
+                    guild,
+                    channel_name=str(getattr(self, "control_room_default_channel_name", "bot-controle")),
+                    operator_id=0,
+                    actor_label="startup",
+                    clear_history=True,
+                )
+                legacy_removed = await self._cleanup_legacy_control_room_channels(
+                    guild,
+                    keep_channel_id=int(result.get("channel_id", 0)),
+                )
+                LOGGER.info(
+                    "control_room bootstrap guild=%s channel=%s created=%s cleared=%s legacy_removed=%s",
+                    guild.id,
+                    result.get("channel_id", 0),
+                    result.get("created", 0),
+                    result.get("cleared_messages", 0),
+                    legacy_removed,
+                )
+            except Exception:
+                LOGGER.warning("Falha ao bootstrap control_room no guild %s", guild.id, exc_info=True)
+
     async def _reject_if_admin_slash_disabled(self, interaction: discord.Interaction, command_name: str) -> bool:
         if self.admin_slash_enabled:
             warned = getattr(self, "_admin_slash_deprecation_seen", set())
@@ -52,6 +125,7 @@ class AdminCommandsMixin:
         channel_name: str,
         operator_id: int,
         actor_label: str,
+        clear_history: bool = False,
     ) -> dict[str, int]:
         topic = (
             "Central de comandos do bot. Somente o bot envia mensagens aqui. "
@@ -77,63 +151,77 @@ class AdminCommandsMixin:
                 attach_files=True,
             )
 
-        channel = discord.utils.get(guild.text_channels, name=channel_name)
-        created = 0
-        if channel is None:
-            channel = await guild.create_text_channel(
-                name=channel_name,
-                topic=topic,
-                overwrites=overwrites,
-                reason=f"Criado por {actor_label} via control_room",
-            )
-            created = 1
-        else:
-            merged_overwrites = dict(channel.overwrites)
-            merged_overwrites.update(overwrites)
-            await channel.edit(topic=topic, overwrites=merged_overwrites, reason="Padronizacao da sala control_room")
-
-        bot_user_id = getattr(getattr(self.bot, "user", None), "id", 0)
-        panel_titles = {"🎛️ Control Room", "🎛️ Central de Comandos"}
-        removed_panels = 0
+        self._control_room_maintenance.add(guild.id)
         try:
-            async for message in channel.history(limit=200):
-                if not message.author or message.author.id != bot_user_id:
-                    continue
-                if not message.embeds:
-                    continue
-                title = (message.embeds[0].title or "").strip()
-                if title not in panel_titles:
-                    continue
+            channel = discord.utils.get(guild.text_channels, name=channel_name)
+            created = 0
+            if channel is None:
+                channel = await guild.create_text_channel(
+                    name=channel_name,
+                    topic=topic,
+                    overwrites=overwrites,
+                    reason=f"Criado por {actor_label} via control_room",
+                )
+                created = 1
+            else:
+                merged_overwrites = dict(channel.overwrites)
+                merged_overwrites.update(overwrites)
+                await channel.edit(topic=topic, overwrites=merged_overwrites, reason="Padronizacao da sala control_room")
+
+            removed_panels = 0
+            cleared_messages = 0
+            if clear_history:
+                cleared_messages = await self._clear_control_room_channel_history(channel)
+            else:
+                bot_user_id = getattr(getattr(self.bot, "user", None), "id", 0)
+                panel_titles = {"🎛️ Control Room", "🎛️ Central de Comandos"}
                 try:
-                    await message.delete()
-                    removed_panels += 1
+                    async for message in channel.history(limit=200):
+                        if not message.author or message.author.id != bot_user_id:
+                            continue
+                        if not message.embeds:
+                            continue
+                        title = (message.embeds[0].title or "").strip()
+                        if title not in panel_titles:
+                            continue
+                        try:
+                            await message.delete()
+                            removed_panels += 1
+                        except Exception:
+                            continue
                 except Exception:
-                    continue
-        except Exception:
-            pass
+                    pass
 
-        self._control_room_operator[guild.id] = operator_id
-        self._control_room_push_history(guild.id, f"{actor_label} abriu/controlou a central")
-        view = ControlRoomView(self, guild.id, operator_user_id=operator_id)
-        embed = await self._build_control_room_embed(guild)
-        panel_message = await channel.send(embed=embed, view=view)
-        try:
-            await panel_message.pin(reason="Painel central do bot")
-        except Exception:
-            pass
-        await self.store.upsert_control_room_state(
-            ControlRoomStateRecord(
-                guild_id=guild.id,
-                channel_id=channel.id,
-                message_id=panel_message.id,
-                operator_user_id=operator_id,
+            self._control_room_operator[guild.id] = operator_id
+            self._control_room_push_history(guild.id, f"{actor_label} abriu/controlou a central")
+            view = ControlRoomView(self, guild.id, operator_user_id=operator_id)
+            embed = await self._build_control_room_embed(guild)
+            panel_message = await channel.send(embed=embed, view=view)
+            try:
+                await panel_message.pin(reason="Painel central do bot")
+            except Exception:
+                pass
+            await self.store.upsert_control_room_state(
+                ControlRoomStateRecord(
+                    guild_id=guild.id,
+                    channel_id=channel.id,
+                    message_id=panel_message.id,
+                    operator_user_id=operator_id,
+                )
             )
-        )
-        self._control_room_state_cache[guild.id] = (channel.id, panel_message.id)
-        self.bot.add_view(ControlRoomView(self, guild.id, operator_user_id=operator_id), message_id=panel_message.id)
-        self._schedule_control_room_status_updater(guild.id)
-        await self._upsert_voice_mini_panel(guild, channel, reason="control_room_bootstrap")
-        return {"created": created, "removed_panels": removed_panels, "channel_id": channel.id, "message_id": panel_message.id}
+            self._control_room_state_cache[guild.id] = (channel.id, panel_message.id)
+            self.bot.add_view(ControlRoomView(self, guild.id, operator_user_id=operator_id), message_id=panel_message.id)
+            self._schedule_control_room_status_updater(guild.id)
+            await self._upsert_voice_mini_panel(guild, channel, reason="control_room_bootstrap")
+            return {
+                "created": created,
+                "removed_panels": removed_panels,
+                "cleared_messages": cleared_messages,
+                "channel_id": channel.id,
+                "message_id": panel_message.id,
+            }
+        finally:
+            self._control_room_maintenance.discard(guild.id)
 
     async def _upsert_voice_mini_panel(
         self,
@@ -379,9 +467,201 @@ class AdminCommandsMixin:
         except Exception:
             return False
 
+    async def _assign_dj_role_to_member(
+        self,
+        *,
+        guild: discord.Guild,
+        actor: discord.abc.User,
+        target_member: discord.Member,
+        dj_role: discord.Role,
+    ) -> tuple[bool, str]:
+        bot_member = guild.me or guild.get_member(getattr(getattr(self.bot, "user", None), "id", 0))
+        if bot_member is None:
+            return False, "Nao consegui validar a identidade do bot neste servidor."
+        if not bot_member.guild_permissions.manage_roles:
+            return False, "O bot precisa da permissao `Manage Roles` para atribuir cargos."
+
+        # Hierarquia do Discord: o bot so pode gerenciar cargos abaixo do maior cargo dele.
+        if dj_role >= bot_member.top_role:
+            return (
+                False,
+                "Nao posso atribuir o cargo DJ porque ele esta acima (ou igual) ao meu maior cargo na hierarquia.",
+            )
+
+        # Tambem nao e possivel alterar cargos de membros com cargo maior/igual ao do bot.
+        if target_member != guild.owner and target_member.top_role >= bot_member.top_role:
+            return (
+                False,
+                "Nao posso editar cargos desse usuario por causa da hierarquia de cargos.",
+            )
+
+        if dj_role in target_member.roles:
+            return True, f"O usuario <@{target_member.id}> ja possui o cargo DJ."
+
+        try:
+            await target_member.add_roles(
+                dj_role,
+                reason=f"Atribuicao automatica de DJ por {getattr(actor, 'display_name', 'admin')} via setup_music_role",
+            )
+            return True, f"Cargo DJ atribuido para <@{target_member.id}> com sucesso."
+        except discord.Forbidden:
+            return False, "Permissao insuficiente para atribuir o cargo DJ. Verifique permissoes e hierarquia."
+        except discord.HTTPException:
+            return False, "Falha de API ao atribuir o cargo DJ. Tente novamente em alguns segundos."
+
+    @app_commands.command(name="setup_music_role", description="Cria o cargo DJ para comandos avancados de musica.")
+    @app_commands.describe(usuario="Usuario para receber o cargo DJ apos a criacao (opcional)")
+    async def setup_music_role(
+        self,
+        interaction: discord.Interaction,
+        usuario: discord.Member | None = None,
+    ) -> None:
+        if await self._reject_if_admin_slash_disabled(interaction, "setup_music_role"):
+            return
+        if not await self._require_control_permissions(interaction):
+            return
+        guild = interaction.guild
+        if guild is None:
+            await self._send_response(
+                interaction,
+                embed=self._warn_embed("Comando indisponivel", "Esse comando so funciona em servidor."),
+                ephemeral=True,
+            )
+            return
+
+        bot_member = guild.me or guild.get_member(getattr(getattr(self.bot, "user", None), "id", 0))
+        if bot_member is None:
+            await self._send_response(
+                interaction,
+                embed=self._error_embed("Estado invalido", "Nao consegui validar as permissoes do bot neste servidor."),
+                ephemeral=True,
+            )
+            return
+
+        # Para criar e gerenciar cargos, o bot precisa explicitamente de Manage Roles.
+        if not bot_member.guild_permissions.manage_roles:
+            await self._send_response(
+                interaction,
+                embed=self._warn_embed(
+                    "Permissao necessaria",
+                    "Preciso da permissao `Manage Roles` para criar o cargo DJ.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        existing_role = discord.utils.get(guild.roles, name="DJ")
+        if existing_role is not None:
+            await self._send_response(
+                interaction,
+                embed=self._warn_embed(
+                    "Cargo existente",
+                    (
+                        f"O cargo **DJ** ja existe neste servidor.\n"
+                        f"ID do cargo: `{existing_role.id}`"
+                    ),
+                ),
+                ephemeral=True,
+            )
+            return
+
+        try:
+            # O cargo nasce com permissao de administrador para centralizar controle de comandos avancados.
+            permissions = discord.Permissions.none()
+            permissions.administrator = True
+            dj_role = await guild.create_role(
+                name="DJ",
+                color=discord.Color.blurple(),
+                hoist=True,
+                mentionable=True,
+                permissions=permissions,
+                reason=f"Criado por {interaction.user.display_name if interaction.user else 'admin'} via setup_music_role",
+            )
+        except discord.Forbidden:
+            await self._send_response(
+                interaction,
+                embed=self._error_embed(
+                    "Falha ao criar cargo",
+                    "Permissao insuficiente para criar o cargo DJ. Verifique `Manage Roles` e hierarquia do bot.",
+                ),
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            await self._send_response(
+                interaction,
+                embed=self._error_embed("Falha ao criar cargo", "A API do Discord recusou a criacao do cargo DJ."),
+                ephemeral=True,
+            )
+            return
+
+        details = (
+            f"Cargo **DJ** criado com sucesso.\n"
+            f"ID do cargo: `{dj_role.id}`\n"
+            "Esse cargo pode ser usado para controlar comandos avancados de musica."
+        )
+        if usuario is not None and isinstance(interaction.user, discord.abc.User):
+            assigned, assign_message = await self._assign_dj_role_to_member(
+                guild=guild,
+                actor=interaction.user,
+                target_member=usuario,
+                dj_role=dj_role,
+            )
+            status_prefix = "Atribuicao automatica" if assigned else "Atribuicao automatica falhou"
+            details = f"{details}\n\n{status_prefix}: {assign_message}"
+
+        await self._send_response(
+            interaction,
+            embed=self._ok_embed("Cargo DJ configurado", details),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="assign_dj_role", description="Atribui o cargo DJ para um usuario especifico.")
+    @app_commands.describe(usuario="Usuario que recebera o cargo DJ")
+    async def assign_dj_role(self, interaction: discord.Interaction, usuario: discord.Member) -> None:
+        if await self._reject_if_admin_slash_disabled(interaction, "assign_dj_role"):
+            return
+        if not await self._require_control_permissions(interaction):
+            return
+        guild = interaction.guild
+        if guild is None:
+            await self._send_response(
+                interaction,
+                embed=self._warn_embed("Comando indisponivel", "Esse comando so funciona em servidor."),
+                ephemeral=True,
+            )
+            return
+
+        dj_role = discord.utils.get(guild.roles, name="DJ")
+        if dj_role is None:
+            await self._send_response(
+                interaction,
+                embed=self._warn_embed("Cargo nao encontrado", "Execute `/setup_music_role` para criar o cargo DJ primeiro."),
+                ephemeral=True,
+            )
+            return
+
+        if not isinstance(interaction.user, discord.abc.User):
+            await self._send_response(
+                interaction,
+                embed=self._error_embed("Permissao", "Nao consegui validar o usuario que executou o comando."),
+                ephemeral=True,
+            )
+            return
+
+        assigned, assign_message = await self._assign_dj_role_to_member(
+            guild=guild,
+            actor=interaction.user,
+            target_member=usuario,
+            dj_role=dj_role,
+        )
+        embed_factory = self._ok_embed if assigned else self._warn_embed
+        title = "Cargo DJ atribuido" if assigned else "Nao foi possivel atribuir"
+        await self._send_response(interaction, embed=embed_factory(title, assign_message), ephemeral=True)
+
     @app_commands.command(name="control_room", description="(Teste) Cria a sala central de comandos do bot.")
     @app_commands.describe(nome="Nome do canal de texto que sera criado/usado")
-    async def control_room(self, interaction: discord.Interaction, nome: str = "bot-controle") -> None:
+    async def control_room(self, interaction: discord.Interaction, nome: str | None = None) -> None:
         if await self._reject_if_admin_slash_disabled(interaction, "control_room"):
             return
         if not await self._require_control_permissions(interaction):
@@ -395,9 +675,10 @@ class AdminCommandsMixin:
             )
             return
 
-        channel_name = (nome or "bot-controle").strip().lower().replace(" ", "-")
+        default_name = str(getattr(self, "control_room_default_channel_name", "bot-controle"))
+        channel_name = (nome or default_name).strip().lower().replace(" ", "-")
         if not channel_name:
-            channel_name = "bot-controle"
+            channel_name = default_name
 
         operator_id = interaction.user.id if interaction.user else 0
         result = await self._provision_control_room(

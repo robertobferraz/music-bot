@@ -46,6 +46,27 @@ class PlayCommandsMixin:
         return host.endswith("spotify.com") or host == "music.apple.com" or host.endswith(".music.apple.com")
 
     @staticmethod
+    def _is_spotify_collection_url(value: str) -> bool:
+        raw = value.strip()
+        if "://" not in raw:
+            return False
+        try:
+            parsed = urlparse(raw)
+        except ValueError:
+            return False
+        host = (parsed.hostname or "").casefold()
+        if host != "open.spotify.com" and not host.endswith(".spotify.com"):
+            return False
+        parts = [part for part in parsed.path.split("/") if part]
+        if not parts:
+            return False
+        if parts[0].startswith("intl-") and len(parts) >= 2:
+            kind = parts[1].casefold()
+        else:
+            kind = parts[0].casefold()
+        return kind in {"playlist", "album"}
+
+    @staticmethod
     def _looks_like_direct_url(value: str) -> bool:
         raw = value.strip()
         return "://" in raw and not raw.startswith("search:")
@@ -62,6 +83,35 @@ class PlayCommandsMixin:
         if self._is_spotify_or_apple_url(query):
             return False
         return True
+
+    @staticmethod
+    def _is_streaming_catalog_url(value: str) -> bool:
+        raw = value.strip()
+        if "://" not in raw:
+            return False
+        try:
+            host = (urlparse(raw).hostname or "").casefold()
+        except ValueError:
+            return False
+        if not host:
+            return False
+        return (
+            host.endswith("spotify.com")
+            or host == "music.apple.com"
+            or host.endswith(".music.apple.com")
+            or host.endswith("deezer.com")
+        )
+
+    @staticmethod
+    def _is_deezer_url(value: str) -> bool:
+        raw = value.strip()
+        if "://" not in raw:
+            return False
+        try:
+            host = (urlparse(raw).hostname or "").casefold()
+        except ValueError:
+            return False
+        return bool(host) and host.endswith("deezer.com")
 
     def _search_result_line(self, idx: int, track: Track) -> str:
         artist = (track.artist or "").strip() or self._guess_artist(track.title) or "desconhecido"
@@ -213,11 +263,48 @@ class PlayCommandsMixin:
         if can_lazy_extract:
             lazy_extract_limit = min(max(self.playlist_initial_enqueue, 1), self.max_playlist_import)
         resolved_spotify = False
-        if self._can_use_lavalink_fastpath(link_ou_busca, to_front=to_front):
+        prefer_lavalink_catalog = (
+            self.lavalink_enabled
+            and self._looks_like_direct_url(link_ou_busca)
+            and self._is_streaming_catalog_url(link_ou_busca)
+            and not self._is_spotify_or_apple_url(link_ou_busca)
+            and not self._is_deezer_url(link_ou_busca)
+            and not self._is_spotify_collection_url(link_ou_busca)
+        )
+        if prefer_lavalink_catalog:
+            lavalink_limit = max(min(self.max_playlist_import, lazy_extract_limit or self.max_playlist_import), 1)
+            lavalink_tracks = await self._search_tracks_lavalink(
+                link_ou_busca.strip(),
+                requester=requester_name,
+                limit=lavalink_limit,
+            )
+            if lavalink_tracks:
+                batch = TrackBatch(
+                    tracks=lavalink_tracks,
+                    total_items=len(lavalink_tracks),
+                    invalid_items=0,
+                )
+                lowered_link = link_ou_busca.casefold()
+                resolved_spotify = "spotify.com" in lowered_link
+            else:
+                batch, resolved_spotify = await self._extract_batch_with_spotify_fallback(
+                    link=link_ou_busca,
+                    requester=requester_name,
+                    max_items=lazy_extract_limit,
+                )
+        elif self._can_use_lavalink_fastpath(link_ou_busca, to_front=to_front):
             normalized_link = link_ou_busca.strip()
+            resolved_fastpath = await self._search_tracks_lavalink(
+                normalized_link,
+                requester=requester_name,
+                limit=1,
+            )
+            fastpath_track = resolved_fastpath[0] if resolved_fastpath else None
             batch = TrackBatch(
                 tracks=[
-                    Track(
+                    fastpath_track
+                    if fastpath_track is not None
+                    else Track(
                         source_query=normalized_link,
                         title=normalized_link,
                         webpage_url=normalized_link,
@@ -384,7 +471,11 @@ class PlayCommandsMixin:
                     await self.queue_service.enqueue(player, track)
                 initial_keys = {self._track_key(track) for track in initial_tracks}
                 remaining_tracks = [track for track in remaining_tracks if self._track_key(track) not in initial_keys]
-                full_playlist_pending = batch.total_items > len(batch.tracks)
+                full_playlist_pending = self._playlist_has_pending_items(
+                    query=link_ou_busca,
+                    batch=batch,
+                    extraction_limit=lazy_extract_limit,
+                )
                 if full_playlist_pending:
                     job_id = None
                     if self.feature_flags.playlist_jobs_enabled:
@@ -453,6 +544,7 @@ class PlayCommandsMixin:
         self._record_query(guild.id, link_ou_busca)
         if queued_now == 1 and queued_later == 0 and batch.total_items == 1 and batch.invalid_items == 0:
             only_track = selected_tracks[0]
+            artist = (only_track.artist or "").strip() or self._guess_artist(only_track.title) or "desconhecido"
             embed = self._ok_embed(
                 (
                     "Musica adicionada (via Spotify)"
@@ -465,7 +557,7 @@ class PlayCommandsMixin:
                 ),
                 (
                     f"**{only_track.title}**\n"
-                    f"`{self._format_duration(only_track.duration_seconds)}` • pedido por `{only_track.requested_by}`"
+                    f"`{self._format_duration(only_track.duration_seconds)}` • artista: `{artist}` • pedido por `{only_track.requested_by}`"
                 ),
             )
         else:
@@ -647,6 +739,11 @@ class PlayCommandsMixin:
             results, stale = self._cache_get_search(guild_cache_key, allow_stale=True)
             cache_scope = "guild"
         if results is not None:
+            display_query = consulta
+            if self._looks_like_direct_url(consulta) and results:
+                lead = results[0]
+                lead_artist = (lead.artist or "").strip() or self._guess_artist(lead.title) or "desconhecido"
+                display_query = f"{lead.title} - {lead_artist}"
             if stale:
                 self._schedule_search_refresh(user_cache_key, consulta, requester, effective_limit)
                 self._schedule_search_refresh(guild_cache_key, consulta, "guild-cache", effective_limit)
@@ -656,7 +753,7 @@ class PlayCommandsMixin:
             )
             embed = self._embed(
                 "🔎 Resultados da Busca",
-                f"Consulta: **{consulta}**\n{self._separator()}\n{description}",
+                f"Consulta: **{display_query}**\n{self._separator()}\n{description}",
                 color=self._theme_color("general"),
             )
             footer = "Resultados em cache"
@@ -694,13 +791,19 @@ class PlayCommandsMixin:
                 await self._send_followup(interaction, embed=embed, ephemeral=True)
             return
 
+        display_query = consulta
+        if self._looks_like_direct_url(consulta) and results:
+            lead = results[0]
+            lead_artist = (lead.artist or "").strip() or self._guess_artist(lead.title) or "desconhecido"
+            display_query = f"{lead.title} - {lead_artist}"
+
         description = "\n".join(
             self._search_result_line(idx + 1, track)
             for idx, track in enumerate(results)
         )
         embed = self._embed(
             "🔎 Resultados da Busca",
-            f"Consulta: **{consulta}**\n{self._separator()}\n{description}",
+            f"Consulta: **{display_query}**\n{self._separator()}\n{description}",
             color=self._theme_color("general"),
         )
         embed.set_footer(text="Selecione no menu abaixo para adicionar na fila.")

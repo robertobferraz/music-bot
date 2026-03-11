@@ -19,6 +19,15 @@ LOGGER = logging.getLogger("botmusica.music")
 
 class RuntimePlaybackMixin:
     @staticmethod
+    def _prefer_native_playback_for_track(track: Track) -> bool:
+        source = (track.source_query or "").casefold().strip()
+        page = (track.webpage_url or "").casefold().strip()
+        if source.startswith(("ytmsearch:", "ytsearch:", "scsearch:")):
+            return True
+        youtube_markers = ("youtube.com", "youtu.be")
+        return any(marker in source for marker in youtube_markers) or any(marker in page for marker in youtube_markers)
+
+    @staticmethod
     def _is_lavalink_player_missing_error(exc: Exception) -> bool:
         status = getattr(exc, "status", None)
         if status == 404:
@@ -49,7 +58,9 @@ class RuntimePlaybackMixin:
         source = (track.source_query or "").strip()
         lowered = source.casefold()
         if lowered.startswith(("ytmsearch:", "ytsearch:", "scsearch:")):
-            return source
+            _, _, terms = source.partition(":")
+            terms = terms.strip()
+            return terms or source
         # Lavalink nao reproduz URL Spotify/Apple Music diretamente.
         # Para esses casos, usa busca textual como fallback robusto.
         if "open.spotify.com" in lowered or "music.apple.com" in lowered:
@@ -60,7 +71,7 @@ class RuntimePlaybackMixin:
             else:
                 terms = f"{raw_title} {track.artist or ''}".strip()
             if terms:
-                return f"ytmsearch:{terms} audio"
+                return f"{terms} audio"
         return source or track.webpage_url or track.title
 
     def _cancel_idle_timer(self, guild_id: int) -> None:
@@ -651,6 +662,10 @@ class RuntimePlaybackMixin:
             track = await player.queue.get()
             self._set_player_state(guild.id, PlayerState.BUFFERING, reason=f"buffering:{track.title[:48]}")
             force_ffmpeg_for_track = self._consume_track_ffmpeg_fallback(guild.id, track)
+            if not force_ffmpeg_for_track and self._prefer_native_playback_for_track(track):
+                # Workaround: youtube-plugin can fail signature extraction intermittently.
+                # For YouTube/search-derived items, prefer native FFmpeg path for reliable playback.
+                force_ffmpeg_for_track = True
             player.recovery_requeued_current = False
             player.current = track
             player.current_started_at = time.monotonic()

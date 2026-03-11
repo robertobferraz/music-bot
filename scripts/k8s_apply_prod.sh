@@ -15,7 +15,14 @@ fi
 
 extract_env_value() {
   local key="$1"
-  grep -E "^${key}=" .env | tail -n 1 | sed -E "s/^${key}=//" || true
+  local raw
+  raw="$(grep -E "^${key}=" .env | tail -n 1 | sed -E "s/^${key}=//" || true)"
+  # Normaliza valores do .env: remove espacos laterais e aspas simples/duplas envolventes.
+  raw="$(printf '%s' "$raw" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  if [[ "$raw" =~ ^\".*\"$ || "$raw" =~ ^\'.*\'$ ]]; then
+    raw="${raw:1:${#raw}-2}"
+  fi
+  printf '%s' "$raw"
 }
 
 DISCORD_TOKEN="$(extract_env_value "DISCORD_TOKEN")"
@@ -27,6 +34,9 @@ WEB_PANEL_DISCORD_REDIRECT_URI="$(extract_env_value "WEB_PANEL_DISCORD_REDIRECT_
 WEB_PANEL_SESSION_SECRET="$(extract_env_value "WEB_PANEL_SESSION_SECRET")"
 POSTGRES_DSN="$(extract_env_value "POSTGRES_DSN")"
 POSTGRES_PASSWORD="$(extract_env_value "POSTGRES_PASSWORD")"
+SPOTIFY_CLIENT_ID="$(extract_env_value "SPOTIFY_CLIENT_ID")"
+SPOTIFY_CLIENT_SECRET="$(extract_env_value "SPOTIFY_CLIENT_SECRET")"
+SPOTIFY_SP_DC="$(extract_env_value "SPOTIFY_SP_DC")"
 BOT_REPOSITORY_BACKEND="$(extract_env_value "BOT_REPOSITORY_BACKEND")"
 BOT_IMAGE_RAW="$(extract_env_value "BOT_IMAGE")"
 BOT_IMAGE="${BOT_IMAGE_RAW:-botmusica:latest}"
@@ -114,6 +124,15 @@ fi
 if [[ -n "${WEB_PANEL_SESSION_SECRET}" ]]; then
   secret_args+=(--from-literal=WEB_PANEL_SESSION_SECRET="${WEB_PANEL_SESSION_SECRET}")
 fi
+if [[ -n "${SPOTIFY_CLIENT_ID}" ]]; then
+  secret_args+=(--from-literal=SPOTIFY_CLIENT_ID="${SPOTIFY_CLIENT_ID}")
+fi
+if [[ -n "${SPOTIFY_CLIENT_SECRET}" ]]; then
+  secret_args+=(--from-literal=SPOTIFY_CLIENT_SECRET="${SPOTIFY_CLIENT_SECRET}")
+fi
+if [[ -n "${SPOTIFY_SP_DC}" ]]; then
+  secret_args+=(--from-literal=SPOTIFY_SP_DC="${SPOTIFY_SP_DC}")
+fi
 kubectl -n botmusica create secret generic botmusica-secret "${secret_args[@]}"
 
 kubectl apply -f deploy/k8s/deployment.yaml
@@ -122,6 +141,8 @@ kubectl apply -f deploy/k8s/service.yaml
 kubectl apply -f deploy/k8s/postgres-deployment.yaml
 kubectl apply -f deploy/k8s/postgres-service.yaml
 kubectl apply -f deploy/k8s/postgres-backup-cronjob.yaml
+kubectl apply -f deploy/k8s/spotify-tokener-deployment.yaml
+kubectl apply -f deploy/k8s/spotify-tokener-service.yaml
 kubectl apply -f deploy/k8s/lavalink-deployment.yaml
 kubectl apply -f deploy/k8s/lavalink-service.yaml
 if kubectl get crd prometheusrules.monitoring.coreos.com >/dev/null 2>&1; then
@@ -132,9 +153,11 @@ fi
 
 # Garante restart real mesmo quando BOT_IMAGE usa a mesma tag.
 kubectl -n botmusica rollout restart deployment/botmusica
+kubectl -n botmusica rollout restart deployment/spotify-tokener
 kubectl -n botmusica rollout restart deployment/lavalink
 
 kubectl -n botmusica rollout status deploy/postgres
 kubectl -n botmusica rollout status deploy/botmusica
+kubectl -n botmusica rollout status deploy/spotify-tokener
 kubectl -n botmusica rollout status deploy/lavalink
 kubectl -n botmusica get pods -o wide

@@ -541,7 +541,11 @@ class ControlRoomPlayModal(discord.ui.Modal, title="Adicionar musica"):
                 initial_enqueue=max(self.cog.playlist_initial_enqueue, 1),
             )
 
-            full_playlist_pending = batch.total_items > len(batch.tracks)
+            full_playlist_pending = self.cog._playlist_has_pending_items(
+                query=query,
+                batch=batch,
+                extraction_limit=lazy_extract_limit,
+            )
             if plan.incremental:
                 initial_tracks = list(plan.immediate)
                 remaining_tracks = candidate_tracks

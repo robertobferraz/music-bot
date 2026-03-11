@@ -38,6 +38,8 @@ class EventHandlersMixin:
 
     @commands.Cog.listener()
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        if payload.guild_id and int(payload.guild_id) in self._control_room_maintenance:
+            return
         for guild_id, state in list(self._control_room_state_cache.items()):
             _channel_id, message_id = state
             if int(payload.message_id) != int(message_id):

@@ -32,14 +32,44 @@ spec:
             - name: _JAVA_OPTIONS
               value: -Xmx2048M
             - name: SERVER_PORT
-              value: "2333"
+              value: '2333'
             - name: YOUTUBE_PLUGIN_VERSION
-              value: "1.18.0"
+              value: '1.18.0'
+            - name: LAVASRC_PLUGIN_VERSION
+              value: '4.8.1'
+            - name: LAVASEARCH_PLUGIN_VERSION
+              value: '1.0.0'
+            - name: SPONSORBLOCK_PLUGIN_VERSION
+              value: '3.0.1'
+            - name: LAVALYRICS_PLUGIN_VERSION
+              value: '1.1.0'
             - name: LAVALINK_SERVER_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: botmusica-secret
                   key: LAVALINK_PASSWORD
+            - name: SPOTIFY_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: botmusica-secret
+                  key: SPOTIFY_CLIENT_ID
+                  optional: true
+            - name: SPOTIFY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: botmusica-secret
+                  key: SPOTIFY_CLIENT_SECRET
+                  optional: true
+            - name: SPOTIFY_SP_DC
+              valueFrom:
+                secretKeyRef:
+                  name: botmusica-secret
+                  key: SPOTIFY_SP_DC
+                  optional: true
+            - name: SPOTIFY_COUNTRY_CODE
+              value: 'US'
+            - name: SPOTIFY_CUSTOM_TOKEN_ENDPOINT
+              value: 'http://spotify-tokener:7080/api/token'
           ports:
             - containerPort: 2333
               name: lavalink
@@ -64,11 +94,11 @@ spec:
             failureThreshold: 30
           resources:
             requests:
-              cpu: "250m"
-              memory: "1024Mi"
+              cpu: '250m'
+              memory: '1024Mi'
             limits:
-              cpu: "1000m"
-              memory: "2048Mi"
+              cpu: '1000m'
+              memory: '2048Mi'
           volumeMounts:
             - name: lavalink-config
               mountPath: /opt/Lavalink/application.yml
@@ -77,7 +107,7 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
-              drop: ["ALL"]
+              drop: ['ALL']
       volumes:
         - name: lavalink-config
           configMap:

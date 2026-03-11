@@ -4,6 +4,7 @@ import asyncio
 import difflib
 import re
 from collections import OrderedDict
+from typing import Any
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
 
@@ -29,6 +30,27 @@ class MusicResolver:
         self.spotify_meta_cache_max_entries = spotify_meta_cache_max_entries
         self._spotify_meta_cache: OrderedDict[str, tuple[float, tuple[str, str]]] = OrderedDict()
         self._http_session: ClientSession | None = None
+
+    @staticmethod
+    def _is_spotify_retryable_error(exc: Exception) -> bool:
+        text = str(exc).casefold()
+        return "429" in text or "too many requests" in text or "temporarily" in text
+
+    async def _run_with_spotify_retry(self, operation: str, fn: Any) -> Any:
+        retries = 3
+        base_delay = 0.8
+        last_exc: Exception | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                return await fn()
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= retries or not self._is_spotify_retryable_error(exc):
+                    raise
+                await asyncio.sleep(base_delay * attempt)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"{operation} failed")
 
     async def close(self) -> None:
         if self._http_session and not self._http_session.closed:
@@ -61,7 +83,10 @@ class MusicResolver:
 
         if self._is_spotify_collection_url(link):
             try:
-                native_batch = await self.extract_tracks(link, requester=requester, max_items=max_items)
+                native_batch = await self._run_with_spotify_retry(
+                    "spotify_collection_extract",
+                    lambda: self.extract_tracks(link, requester=requester, max_items=max_items),
+                )
             except Exception:
                 native_batch = None
             if native_batch is not None:
@@ -74,13 +99,16 @@ class MusicResolver:
             raise RuntimeError("Spotify nao resolvido: nao consegui obter metadados para busca.")
 
         try:
-            candidates = await asyncio.wait_for(
-                self.search_tracks(
-                    spotify_meta[0] if spotify_meta[0] else spotify_meta[1],
-                    requester=requester,
-                    limit=self.spotify_candidate_limit,
+            candidates = await self._run_with_spotify_retry(
+                "spotify_candidates_search",
+                lambda: asyncio.wait_for(
+                    self.search_tracks(
+                        spotify_meta[0] if spotify_meta[0] else spotify_meta[1],
+                        requester=requester,
+                        limit=self.spotify_candidate_limit,
+                    ),
+                    timeout=8.0,
                 ),
-                timeout=8.0,
             )
         except asyncio.TimeoutError:
             fallback_track = self._spotify_fallback_track(spotify_meta, link, requester=requester)
@@ -105,13 +133,16 @@ class MusicResolver:
             raise RuntimeError("Spotify nao resolvido: nao consegui obter metadados para busca.")
 
         try:
-            candidates = await asyncio.wait_for(
-                self.search_tracks(
-                    spotify_meta[0] if spotify_meta[0] else spotify_meta[1],
-                    requester=requester,
-                    limit=self.spotify_candidate_limit,
+            candidates = await self._run_with_spotify_retry(
+                "spotify_track_search",
+                lambda: asyncio.wait_for(
+                    self.search_tracks(
+                        spotify_meta[0] if spotify_meta[0] else spotify_meta[1],
+                        requester=requester,
+                        limit=self.spotify_candidate_limit,
+                    ),
+                    timeout=8.0,
                 ),
-                timeout=8.0,
             )
         except asyncio.TimeoutError:
             return self._spotify_fallback_track(spotify_meta, link, requester=requester), True
@@ -127,7 +158,7 @@ class MusicResolver:
         title = (meta[0] or "").strip() or "Faixa Spotify"
         artist = (meta[1] or "").strip() or None
         terms = f"{title} {artist or ''}".strip()
-        query = f"ytmsearch:{terms} audio" if terms else "ytmsearch:spotify track audio"
+        query = f"ytsearch1:{terms} audio" if terms else "ytsearch1:spotify track audio"
         return Track(
             source_query=query,
             title=title,
@@ -153,7 +184,7 @@ class MusicResolver:
             if not terms:
                 extra_invalid += 1
                 continue
-            query = f"ytmsearch:{terms} audio"
+            query = f"ytsearch1:{terms} audio"
             converted.append(
                 Track(
                     source_query=query,

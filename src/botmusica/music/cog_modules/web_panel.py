@@ -167,6 +167,7 @@ class WebPanelMixin:
                 "cache_clear_all",
                 "diagnostics",
                 "control_room_create",
+                "music_role_setup",
             }
             dj_or_admin = {
                 "skip",
@@ -365,6 +366,7 @@ class WebPanelMixin:
                 player = await self._get_player(guild.id)
                 vc = guild.voice_client
                 policy = self._policy_for_guild(guild.id)
+                dj_role = discord.utils.get(guild.roles, name="DJ")
                 queue_snapshot = player.snapshot_queue()
                 queue_preview = [track.title for track in queue_snapshot[:7]]
                 control_state = await self.store.get_control_room_state(guild.id)
@@ -415,6 +417,14 @@ class WebPanelMixin:
                             "configured": bool(control_state),
                             "channel_id": str(control_state.channel_id) if control_state else "0",
                             "message_id": str(control_state.message_id) if control_state else "0",
+                        },
+                        "dj_role": {
+                            "exists": dj_role is not None,
+                            "role_id": str(dj_role.id) if dj_role else "0",
+                            "hoist": bool(dj_role.hoist) if dj_role else False,
+                            "mentionable": bool(dj_role.mentionable) if dj_role else False,
+                            "administrator": bool(dj_role.permissions.administrator) if dj_role else False,
+                            "color": f"#{dj_role.color.value:06x}" if dj_role else "#000000",
                         },
                     }
                 )
@@ -577,9 +587,10 @@ class WebPanelMixin:
                 )
 
             if action == "control_room_create":
-                channel_name = str(payload.get("name") or "bot-controle").strip().lower().replace(" ", "-")
+                default_name = str(getattr(self, "control_room_default_channel_name", "bot-controle"))
+                channel_name = str(payload.get("name") or default_name).strip().lower().replace(" ", "-")
                 if not channel_name:
-                    channel_name = "bot-controle"
+                    channel_name = default_name
                 result = await self._provision_control_room(
                     guild,
                     channel_name=channel_name,
@@ -587,6 +598,126 @@ class WebPanelMixin:
                     actor_label="web-panel",
                 )
                 return web.json_response({"ok": True, "action": action, **result})
+
+            if action == "music_role_setup":
+                bot_member = guild.me or guild.get_member(getattr(getattr(self.bot, "user", None), "id", 0))
+                if bot_member is None:
+                    return web.json_response(
+                        {"ok": False, "error": "bot_member_not_found", "message": "Nao consegui validar o bot neste servidor."},
+                        status=409,
+                    )
+                if not bot_member.guild_permissions.manage_roles:
+                    return web.json_response(
+                        {
+                            "ok": False,
+                            "error": "missing_manage_roles",
+                            "message": "O bot precisa da permissao Manage Roles para criar/atribuir o cargo DJ.",
+                        },
+                        status=403,
+                    )
+
+                existing_role = discord.utils.get(guild.roles, name="DJ")
+                target_user_id = self._panel_payload_int(payload, "target_user_id")
+                target_member = guild.get_member(target_user_id) if target_user_id and target_user_id > 0 else None
+                if target_user_id and target_user_id > 0 and target_member is None:
+                    try:
+                        target_member = await guild.fetch_member(target_user_id)
+                    except Exception:
+                        return web.json_response(
+                            {
+                                "ok": False,
+                                "error": "target_member_not_found",
+                                "message": f"Usuario informado nao foi encontrado no servidor selecionado ({guild.name}).",
+                            },
+                            status=404,
+                        )
+
+                if existing_role is not None:
+                    response: dict[str, Any] = {
+                        "ok": True,
+                        "action": action,
+                        "already_exists": True,
+                        "role_id": str(existing_role.id),
+                        "message": f"O cargo DJ ja existe (ID: {existing_role.id}).",
+                    }
+                    if target_member is not None:
+                        actor_user = self.bot.user
+                        if actor_user is None:
+                            return web.json_response(
+                                {"ok": False, "error": "bot_user_missing", "message": "Nao consegui validar o usuario do bot."},
+                                status=409,
+                            )
+                        assigned, assign_message = await self._assign_dj_role_to_member(
+                            guild=guild,
+                            actor=actor_user,
+                            target_member=target_member,
+                            dj_role=existing_role,
+                        )
+                        response["assigned"] = assigned
+                        response["assign_message"] = assign_message
+                        if assigned:
+                            response["message"] = f"{response['message']} {assign_message}"
+                    return web.json_response(response)
+
+                try:
+                    permissions = discord.Permissions.none()
+                    permissions.administrator = True
+                    dj_role = await guild.create_role(
+                        name="DJ",
+                        color=discord.Color.blurple(),
+                        hoist=True,
+                        mentionable=True,
+                        permissions=permissions,
+                        reason="Criado via web panel (music_role_setup)",
+                    )
+                except discord.Forbidden:
+                    return web.json_response(
+                        {
+                            "ok": False,
+                            "error": "role_create_forbidden",
+                            "message": "Permissao insuficiente para criar o cargo DJ. Verifique Manage Roles e hierarquia.",
+                        },
+                        status=403,
+                    )
+                except discord.HTTPException:
+                    return web.json_response(
+                        {
+                            "ok": False,
+                            "error": "role_create_failed",
+                            "message": "A API do Discord falhou ao criar o cargo DJ.",
+                        },
+                        status=502,
+                    )
+
+                response = {
+                    "ok": True,
+                    "action": action,
+                    "already_exists": False,
+                    "role_id": str(dj_role.id),
+                    "message": (
+                        f"Cargo DJ criado com sucesso (ID: {dj_role.id}). "
+                        "Esse cargo pode controlar comandos avancados de musica."
+                    ),
+                }
+
+                if target_member is not None:
+                    actor_user = self.bot.user
+                    if actor_user is None:
+                        return web.json_response(
+                            {"ok": False, "error": "bot_user_missing", "message": "Nao consegui validar o usuario do bot."},
+                            status=409,
+                        )
+                    assigned, assign_message = await self._assign_dj_role_to_member(
+                        guild=guild,
+                        actor=actor_user,
+                        target_member=target_member,
+                        dj_role=dj_role,
+                    )
+                    response["assigned"] = assigned
+                    response["assign_message"] = assign_message
+                    response["message"] = f"{response['message']} {assign_message}"
+
+                return web.json_response(response)
 
             if action == "skip":
                 if not self._is_voice_connected(voice_client):

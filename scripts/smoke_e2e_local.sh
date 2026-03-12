@@ -14,16 +14,8 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "[smoke] subindo stack bot+lavalink..."
+echo "[smoke] subindo stack bot..."
 docker compose up -d --build
-
-echo "[smoke] aguardando lavalink..."
-for _ in {1..40}; do
-  if docker compose logs lavalink 2>/dev/null | grep -qi "Started Launcher\|Lavalink is ready\|Started SpringApplication"; then
-    break
-  fi
-  sleep 2
-done
 
 echo "[smoke] aguardando bot conectar..."
 for _ in {1..45}; do
@@ -36,5 +28,5 @@ done
 
 echo "[smoke] falhou: bot nao conectou no tempo esperado"
 docker compose ps
-docker compose logs --tail=120 botmusica lavalink || true
+docker compose logs --tail=120 botmusica || true
 exit 1

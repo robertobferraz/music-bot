@@ -1,11 +1,11 @@
 # Bot de Música para Discord
 
-Bot de música para Discord com comandos slash (`/`), reprodução via `yt-dlp` e suporte a Lavalink.
+Bot de música para Discord com comandos slash (`/`) e reprodução via `yt-dlp` + `ffmpeg`.
 
 ## O que o projeto cobre
 - Fila por servidor com persistência
 - Busca (`/search`) com cache e autocomplete
-- Reprodução com fallback (`yt-dlp` e/ou Lavalink)
+- Reprodução nativa (`yt-dlp` + `ffmpeg`)
 - Favoritos e playlists pessoais
 - Painel web opcional com status e ações
 - Painel web com login Discord OAuth2 + RBAC (`admin`/`dj`/`viewer`)
@@ -15,7 +15,6 @@ Bot de música para Discord com comandos slash (`/`), reprodução via `yt-dlp` 
 - Python 3.11+
 - `discord.py`
 - `yt-dlp`
-- `wavelink`
 - `ffmpeg`
 - SQLite (padrão) ou PostgreSQL
 
@@ -62,15 +61,6 @@ BOT_REPOSITORY_BACKEND=postgres
 POSTGRES_DSN=postgresql://usuario:senha@host:5432/botmusica
 ```
 
-Para reprodução com Lavalink:
-
-```env
-LAVALINK_ENABLED=false
-LAVALINK_HOST=lavalink
-LAVALINK_PORT=2333
-LAVALINK_PASSWORD=sua_senha
-```
-
 Observação: o arquivo [.env.example](./.env.example) tem opções detalhadas de tuning.
 
 ## Comandos principais
@@ -115,7 +105,7 @@ pytest
 ```
 
 ## Docker-Compose
-Subida local com bot + lavalink + postgres:
+Subida local com bot + postgres:
 
 ```bash
 docker-compose up -d --build
@@ -128,7 +118,7 @@ curl -fsS http://127.0.0.1:8090/health
 
 Logs:
 ```bash
-docker-compose logs -f botmusica lavalink postgres
+docker-compose logs -f botmusica postgres
 ```
 
 Parar:
@@ -160,7 +150,6 @@ Aplicar stack:
 O script de apply em modo prod exige:
 - `WEB_PANEL_ADMIN_TOKEN` forte (>=32 chars)
 - `POSTGRES_PASSWORD` forte (>=16 chars)
-- `BOT_IMAGE` com tag imutavel (nao `:latest`, a menos que use `ALLOW_LATEST_IMAGE=true`)
 
 Reset + apply:
 ```bash
@@ -189,6 +178,10 @@ kubectl -n botmusica port-forward svc/botmusica-web 8080:8080
 - `Backend postgres requer psycopg[binary]`: `pip install -e .[postgres]`
 - Falha de busca YouTube: revisar `YTDLP_JS_RUNTIME` e `YTDLP_REMOTE_COMPONENTS`
 
+## Notas para publicar no GitHub
+- Não versionar `.env`, `data/`, `*.db`, `__pycache__`, `*.pyc`
+- Revisar segredos em manifests e scripts antes do push
+- Manter `.env.example` como referência pública
 
 ## License
 Este projeto está licenciado sob **MIT** (`MIT`).

@@ -438,7 +438,6 @@ def build_web_panel_html() -> str:
       <div class="nodes">
         <p class="nav-title">Runtime</p>
         <div class="node"><span class="sig ok"></span> Backend: <strong id="side-backend">-</strong></div>
-        <div class="node"><span class="sig warn"></span> Lavalink: <strong id="side-lavalink">-</strong></div>
         <div class="node"><span class="sig bad"></span> Servidores: <strong id="side-guilds">0</strong></div>
       </div>
     </aside>
@@ -469,7 +468,6 @@ def build_web_panel_html() -> str:
         <article class="card"><div class="k">Latência</div><div id="avg-latency" class="v">0.0 ms</div></article>
         <article class="card"><div class="k">Uptime</div><div id="uptime" class="v">0s</div></article>
         <article class="card"><div class="k">Backend</div><div id="runtime-backend" class="v">-</div></article>
-        <article class="card"><div class="k">Lavalink</div><div id="lavalink-mode" class="v">-</div></article>
         <article class="card"><div class="k">Play p95 / p99</div><div class="v"><span id="p95-play">0.0</span> / <span id="p99-play">0.0</span></div></article>
         <article class="card"><div class="k">Search p95 / p99</div><div class="v"><span id="p95-search">0.0</span> / <span id="p99-search">0.0</span></div></article>
         <article class="card"><div class="k">Play p50</div><div id="p50-play" class="v">0.0 ms</div></article>
@@ -653,11 +651,9 @@ def build_web_panel_html() -> str:
       botUser: document.getElementById("bot-user"), guildsTotal: document.getElementById("guilds-total"),
       commandCalls: document.getElementById("command-calls"), commandErrors: document.getElementById("command-errors"),
       avgLatency: document.getElementById("avg-latency"), uptime: document.getElementById("uptime"),
-      runtimeBackend: document.getElementById("runtime-backend"), lavalinkMode: document.getElementById("lavalink-mode"),
       p95Play: document.getElementById("p95-play"), p99Play: document.getElementById("p99-play"),
       p95Search: document.getElementById("p95-search"), p99Search: document.getElementById("p99-search"),
       p50Play: document.getElementById("p50-play"), p50Search: document.getElementById("p50-search"),
-      sideBackend: document.getElementById("side-backend"), sideLavalink: document.getElementById("side-lavalink"), sideGuilds: document.getElementById("side-guilds"),
       guildList: document.getElementById("guild-list"), guildSearch: document.getElementById("guild-search"), guildSelect: document.getElementById("guild-select"),
       refreshBtn: document.getElementById("refresh-btn"), selectedRole: document.getElementById("selected-role"),
       guildState: document.getElementById("guild-state"), guildVoice: document.getElementById("guild-voice"), guildQueue: document.getElementById("guild-queue"),
@@ -818,9 +814,7 @@ def build_web_panel_html() -> str:
       refs.avgLatency.textContent=`${fmtMs(payload.metrics?.average_latency_ms)} ms`;
       refs.uptime.textContent=fmtUptime(payload.runtime?.uptime_seconds);
       refs.runtimeBackend.textContent=payload.runtime?.repository_backend||'-';
-      refs.lavalinkMode.textContent=payload.runtime?.lavalink_enabled?'enabled':'fallback';
       refs.sideBackend.textContent=payload.runtime?.repository_backend||'-';
-      refs.sideLavalink.textContent=payload.runtime?.lavalink_enabled?'enabled':'fallback';
       refs.sideGuilds.textContent=String(guilds.length);
       const slo=payload.metrics?.slo_5m||{};
       refs.p95Play.textContent=fmtMs(slo.play_p95_ms);

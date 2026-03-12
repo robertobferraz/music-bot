@@ -19,8 +19,8 @@ services:
     volumes:
       - ./data:/data
     ports:
-      - "127.0.0.1:8080:8080"
-      - "127.0.0.1:8090:8090"
+      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:18090:8090"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2).read()\""]
       interval: 30s
@@ -28,45 +28,8 @@ services:
       retries: 3
       start_period: 40s
     depends_on:
-      lavalink:
-        condition: service_healthy
       postgres:
         condition: service_healthy
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  lavalink:
-    image: ghcr.io/lavalink-devs/lavalink:4
-    container_name: lavalink
-    restart: unless-stopped
-    stop_grace_period: 25s
-    environment:
-      _JAVA_OPTIONS: "-Xmx2048M"
-      SERVER_PORT: "2333"
-      LAVALINK_SERVER_PASSWORD: "${LAVALINK_PASSWORD}"
-      YOUTUBE_PLUGIN_VERSION: "1.18.0"
-      SPOTIFY_CLIENT_ID: "${SPOTIFY_CLIENT_ID:-}"
-      SPOTIFY_CLIENT_SECRET: "${SPOTIFY_CLIENT_SECRET:-}"
-      SPOTIFY_SP_DC: "${SPOTIFY_SP_DC:-}"
-      SPOTIFY_COUNTRY_CODE: "${SPOTIFY_COUNTRY_CODE:-US}"
-      SPOTIFY_CUSTOM_TOKEN_ENDPOINT: "${SPOTIFY_CUSTOM_TOKEN_ENDPOINT:-http://spotify-tokener:7080/api/token}"
-    volumes:
-      - ./deploy/lavalink/application.yml:/opt/Lavalink/application.yml:ro
-    ports:
-      - "127.0.0.1:2333:2333"
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "wget --header=\"Authorization: $${LAVALINK_SERVER_PASSWORD}\" -q -O /dev/null http://127.0.0.1:2333/version",
-        ]
-      interval: 20s
-      timeout: 5s
-      retries: 8
-      start_period: 35s
     logging:
       driver: json-file
       options:
@@ -85,7 +48,7 @@ services:
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:55432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U botmusica -d botmusica -h 127.0.0.1 -p 5432"]
       interval: 10s

@@ -18,14 +18,11 @@ def _track(name: str) -> SimpleNamespace:
 
 def test_search_pipeline_prefers_cache_then_stops() -> None:
     async def _run() -> None:
-        pipeline = SearchPipeline(cache_timeout_seconds=0.2, lavalink_timeout_seconds=0.2, resolver_timeout_seconds=0.2)
+        pipeline = SearchPipeline(cache_timeout_seconds=0.2, resolver_timeout_seconds=0.2)
         request = SearchPipelineRequest(query="abc", requester="tester", limit=3, guild_id=1, user_id=2)
 
         async def cache_lookup(_req: SearchPipelineRequest) -> tuple[list[SimpleNamespace] | None, bool]:
             return [_track("cached")], False
-
-        async def lavalink_lookup(_req: SearchPipelineRequest) -> list[SimpleNamespace]:
-            raise AssertionError("lavalink should not be called when cache hits")
 
         async def resolver_lookup(_req: SearchPipelineRequest) -> list[SimpleNamespace]:
             raise AssertionError("resolver should not be called when cache hits")
@@ -33,7 +30,6 @@ def test_search_pipeline_prefers_cache_then_stops() -> None:
         result = await pipeline.run(
             request,
             cache_lookup=cache_lookup,
-            lavalink_lookup=lavalink_lookup,
             resolver_lookup=resolver_lookup,
         )
         assert result.source == "cache"
@@ -42,42 +38,13 @@ def test_search_pipeline_prefers_cache_then_stops() -> None:
     asyncio.run(_run())
 
 
-def test_search_pipeline_uses_lavalink_before_resolver() -> None:
-    async def _run() -> None:
-        pipeline = SearchPipeline(cache_timeout_seconds=0.2, lavalink_timeout_seconds=0.2, resolver_timeout_seconds=0.2)
-        request = SearchPipelineRequest(query="abc", requester="tester", limit=3)
-
-        async def cache_lookup(_req: SearchPipelineRequest) -> tuple[list[SimpleNamespace] | None, bool]:
-            return None, False
-
-        async def lavalink_lookup(_req: SearchPipelineRequest) -> list[SimpleNamespace]:
-            return [_track("lavalink")]
-
-        async def resolver_lookup(_req: SearchPipelineRequest) -> list[SimpleNamespace]:
-            raise AssertionError("resolver should not be called when lavalink hits")
-
-        result = await pipeline.run(
-            request,
-            cache_lookup=cache_lookup,
-            lavalink_lookup=lavalink_lookup,
-            resolver_lookup=resolver_lookup,
-        )
-        assert result.source == "lavalink"
-        assert result.tracks[0].title == "lavalink"
-
-    asyncio.run(_run())
-
-
 def test_search_pipeline_falls_back_to_resolver() -> None:
     async def _run() -> None:
-        pipeline = SearchPipeline(cache_timeout_seconds=0.2, lavalink_timeout_seconds=0.2, resolver_timeout_seconds=0.2)
+        pipeline = SearchPipeline(cache_timeout_seconds=0.2, resolver_timeout_seconds=0.2)
         request = SearchPipelineRequest(query="abc", requester="tester", limit=3)
 
         async def cache_lookup(_req: SearchPipelineRequest) -> tuple[list[SimpleNamespace] | None, bool]:
             return None, False
-
-        async def lavalink_lookup(_req: SearchPipelineRequest) -> list[SimpleNamespace]:
-            return []
 
         async def resolver_lookup(_req: SearchPipelineRequest) -> list[SimpleNamespace]:
             return [_track("resolver")]
@@ -85,7 +52,6 @@ def test_search_pipeline_falls_back_to_resolver() -> None:
         result = await pipeline.run(
             request,
             cache_lookup=cache_lookup,
-            lavalink_lookup=lavalink_lookup,
             resolver_lookup=resolver_lookup,
         )
         assert result.source == "resolver"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Smoke test de integracao: bot + Lavalink + Postgres
+# Smoke test de integracao: bot + Postgres
 # Requisitos:
 # - variaveis sensiveis no ambiente (sem placeholders/defaults fracos)
 # - docker compose v2
@@ -24,23 +24,10 @@ if [[ "${POSTGRES_DSN}" == "postgresql://botmusica:botmusica@postgres:5432/botmu
   exit 1
 fi
 
-if [[ -z "${LAVALINK_PASSWORD:-}" ]]; then
-  echo "LAVALINK_PASSWORD nao definido. Exporte antes de rodar."
-  exit 1
-fi
-if [[ "${LAVALINK_PASSWORD}" == "youshallnotpass" || ${#LAVALINK_PASSWORD} -lt 12 ]]; then
-  echo "LAVALINK_PASSWORD insegura. Use senha forte (>=12) e nao use default."
-  exit 1
-fi
-
 export BOT_REPOSITORY_BACKEND=postgres
 export POSTGRES_DSN="${POSTGRES_DSN}"
-export LAVALINK_ENABLED=false
-export LAVALINK_HOST=lavalink
-export LAVALINK_PORT=2333
-export LAVALINK_PASSWORD="${LAVALINK_PASSWORD}"
 
-docker compose up -d postgres lavalink botmusica
+docker compose up -d postgres botmusica
 
 echo "Aguardando healthcheck do bot..."
 for _ in {1..40}; do
@@ -52,5 +39,5 @@ for _ in {1..40}; do
 done
 
 echo "Falha: healthcheck nao respondeu dentro do tempo esperado."
-docker compose logs --tail=120 botmusica lavalink postgres || true
+docker compose logs --tail=120 botmusica postgres || true
 exit 1

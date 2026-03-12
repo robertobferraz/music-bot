@@ -26,7 +26,6 @@ extract_env_value() {
 }
 
 DISCORD_TOKEN="$(extract_env_value "DISCORD_TOKEN")"
-LAVALINK_PASSWORD="$(extract_env_value "LAVALINK_PASSWORD")"
 WEB_PANEL_ADMIN_TOKEN="$(extract_env_value "WEB_PANEL_ADMIN_TOKEN")"
 WEB_PANEL_DISCORD_CLIENT_ID="$(extract_env_value "WEB_PANEL_DISCORD_CLIENT_ID")"
 WEB_PANEL_DISCORD_CLIENT_SECRET="$(extract_env_value "WEB_PANEL_DISCORD_CLIENT_SECRET")"
@@ -42,16 +41,8 @@ BOT_IMAGE_RAW="$(extract_env_value "BOT_IMAGE")"
 BOT_IMAGE="${BOT_IMAGE_RAW:-botmusica:latest}"
 ALLOW_LATEST_IMAGE="${ALLOW_LATEST_IMAGE:-false}"
 
-if [[ -z "${DISCORD_TOKEN}" || -z "${LAVALINK_PASSWORD}" ]]; then
-  echo "ERRO: DISCORD_TOKEN e LAVALINK_PASSWORD precisam estar definidos no .env."
-  exit 1
-fi
 if [[ "${DISCORD_TOKEN}" == "seu_token_aqui" || "${DISCORD_TOKEN}" == "COLOQUE_SEU_TOKEN_AQUI" || ${#DISCORD_TOKEN} -lt 30 ]]; then
   echo "ERRO: DISCORD_TOKEN invalido/placeholder no .env."
-  exit 1
-fi
-if [[ "${LAVALINK_PASSWORD}" == "youshallnotpass" || ${#LAVALINK_PASSWORD} -lt 12 ]]; then
-  echo "ERRO: LAVALINK_PASSWORD insegura. Use senha forte (>=12) e nao use default."
   exit 1
 fi
 if [[ -z "${POSTGRES_PASSWORD}" || "${POSTGRES_PASSWORD}" == "botmusica" || ${#POSTGRES_PASSWORD} -lt 16 ]]; then
@@ -96,7 +87,6 @@ fi
 
 kubectl apply -f deploy/k8s/namespace.yaml
 kubectl apply -f deploy/k8s/configmap.yaml
-kubectl apply -f deploy/k8s/lavalink-configmap.yaml
 kubectl apply -f deploy/k8s/pvc.yaml
 kubectl apply -f deploy/k8s/postgres-pvc.yaml
 kubectl apply -f deploy/k8s/postgres-backup-pvc.yaml
@@ -105,7 +95,6 @@ kubectl apply -f deploy/k8s/pdb.yaml
 kubectl -n botmusica delete secret botmusica-secret --ignore-not-found=true
 secret_args=(
   --from-literal=DISCORD_TOKEN="${DISCORD_TOKEN}"
-  --from-literal=LAVALINK_PASSWORD="${LAVALINK_PASSWORD}"
   --from-literal=POSTGRES_DSN="${POSTGRES_DSN}"
   --from-literal=POSTGRES_PASSWORD="${POSTGRES_PASSWORD}"
 )
@@ -143,8 +132,6 @@ kubectl apply -f deploy/k8s/postgres-service.yaml
 kubectl apply -f deploy/k8s/postgres-backup-cronjob.yaml
 kubectl apply -f deploy/k8s/spotify-tokener-deployment.yaml
 kubectl apply -f deploy/k8s/spotify-tokener-service.yaml
-kubectl apply -f deploy/k8s/lavalink-deployment.yaml
-kubectl apply -f deploy/k8s/lavalink-service.yaml
 if kubectl get crd prometheusrules.monitoring.coreos.com >/dev/null 2>&1; then
   kubectl apply -f deploy/k8s/prometheus-rules.yaml
 else
@@ -154,10 +141,8 @@ fi
 # Garante restart real mesmo quando BOT_IMAGE usa a mesma tag.
 kubectl -n botmusica rollout restart deployment/botmusica
 kubectl -n botmusica rollout restart deployment/spotify-tokener
-kubectl -n botmusica rollout restart deployment/lavalink
 
 kubectl -n botmusica rollout status deploy/postgres
 kubectl -n botmusica rollout status deploy/botmusica
 kubectl -n botmusica rollout status deploy/spotify-tokener
-kubectl -n botmusica rollout status deploy/lavalink
 kubectl -n botmusica get pods -o wide

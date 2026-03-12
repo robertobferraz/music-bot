@@ -1,7 +1,6 @@
 services:
   botmusica:
     environment:
-      LAVALINK_ENABLED: "true"
       WEB_PANEL_ENABLED: "true"
       WEB_PANEL_HOST: "127.0.0.1"
       WEB_PANEL_PORT: "8080"

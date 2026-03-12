@@ -1,23 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 import logging
 import os
 import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
-from typing import Any
 from urllib.parse import urlparse
 
 import discord
 from aiohttp import ClientSession, ClientTimeout, web
 from discord import app_commands
 from discord.ext import commands
-
-try:
-    import wavelink
-except ImportError:
-    wavelink = None
 
 from botmusica.music.embeds import MusicEmbeds
 from botmusica.music.circuit_breaker import CircuitBreaker
@@ -97,18 +92,19 @@ class MusicCog(
         self.bot = bot
         self.embeds = MusicEmbeds(bot)
         self.music = MusicService()
+        self.store = create_repository(
+            db_path=getattr(bot, "db_path", "botmusica.db"),
+            backend=str(getattr(bot, "repository_backend", "sqlite")),
+            postgres_dsn=str(getattr(bot, "postgres_dsn", "")),
+        )
         self.resolver = MusicResolver(
             self.music,
+            store=self.store,
             spotify_strict_match=bool(getattr(bot, "spotify_strict_match", True)),
             spotify_match_threshold=float(getattr(bot, "spotify_match_threshold", 0.55)),
             spotify_candidate_limit=int(getattr(bot, "spotify_candidate_limit", 3)),
             spotify_meta_cache_ttl_seconds=float(getattr(bot, "spotify_meta_cache_ttl_seconds", 900.0)),
             spotify_meta_cache_max_entries=int(getattr(bot, "spotify_meta_cache_max_entries", 256)),
-        )
-        self.store = create_repository(
-            db_path=getattr(bot, "db_path", "botmusica.db"),
-            backend=str(getattr(bot, "repository_backend", "sqlite")),
-            postgres_dsn=str(getattr(bot, "postgres_dsn", "")),
         )
         self.queue_service = QueueService()
         self._play_locks: dict[int, asyncio.Lock] = {}
@@ -149,8 +145,18 @@ class MusicCog(
         self._retention_task: asyncio.Task[None] | None = None
         self._startup_warmup_task: asyncio.Task[None] | None = None
         self._startup_warmup_done: bool = False
+        self._control_room_restore_task: asyncio.Task[None] | None = None
+        self._control_room_restore_done: bool = False
+        self._store_init_retry_attempts = max(int(os.getenv("STORE_INIT_RETRY_ATTEMPTS", "20").strip() or "20"), 1)
+        self._store_init_retry_delay_seconds = max(
+            float(os.getenv("STORE_INIT_RETRY_DELAY_SECONDS", "3").strip() or "3"),
+            1.0,
+        )
+        self._critical_worker_restart_delay_seconds = max(
+            float(os.getenv("CRITICAL_WORKER_RESTART_DELAY_SECONDS", "5").strip() or "5"),
+            1.0,
+        )
         self._last_health_alert_at: dict[str, float] = {}
-        self._last_lavalink_connected: bool | None = None
         self._latency_total_ms: float = 0.0
         self._latency_count: int = 0
         self._boot_started_mono: float = time.monotonic()
@@ -164,10 +170,8 @@ class MusicCog(
         self._query_usage_flush_task: asyncio.Task[None] | None = None
         self._queue_event_flush_lock = asyncio.Lock()
         self._query_usage_flush_lock = asyncio.Lock()
-        self._lavalink_track_failures: dict[int, set[str]] = defaultdict(set)
-        self._lavalink_playable_cache: OrderedDict[str, tuple[float, Any]] = OrderedDict()
-        self._lavalink_voice_retry_after: dict[int, float] = {}
         self._voice_reconnect_required: set[int] = set()
+        self._playback_watchdog_tasks: dict[int, asyncio.Task[None]] = {}
         self._control_room_state_cache: dict[int, tuple[int, int]] = {}
         self._control_room_operator: dict[int, int] = {}
         self._control_room_action_locks: dict[int, asyncio.Lock] = {}
@@ -179,6 +183,12 @@ class MusicCog(
         self.max_queue_size = int(getattr(bot, "max_queue_size", 50))
         self.max_user_queue_items = int(getattr(bot, "max_user_queue_items", 0))
         self.max_playlist_import = int(getattr(bot, "max_playlist_import", 100))
+        self.restore_queue_on_startup = os.getenv("QUEUE_RESTORE_ON_STARTUP", "true").strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self.play_cooldown_seconds = float(getattr(bot, "play_cooldown_seconds", 3.0))
         self.default_max_track_duration_seconds = int(getattr(bot, "max_track_duration_seconds", 0))
         self.default_domain_whitelist = {item.casefold() for item in getattr(bot, "domain_whitelist", tuple()) if item}
@@ -220,6 +230,9 @@ class MusicCog(
         self.playlist_initial_enqueue = int(getattr(bot, "playlist_initial_enqueue", 10))
         self.playlist_incremental_chunk_size = int(getattr(bot, "playlist_incremental_chunk_size", 20))
         self.playlist_incremental_chunk_delay_seconds = float(getattr(bot, "playlist_incremental_chunk_delay_seconds", 0.15))
+        self.playlist_lazy_resolve_start_delay_seconds = float(
+            os.getenv("PLAYLIST_LAZY_RESOLVE_START_DELAY_SECONDS", "4.0").strip() or "4.0"
+        )
         self.playlist_chunk_retry_attempts = 3
         self.playlist_chunk_retry_base_delay_seconds = 0.45
         self.search_cache_ttl_seconds = float(getattr(bot, "search_cache_ttl_seconds", 30.0))
@@ -233,7 +246,7 @@ class MusicCog(
             os.getenv("AUTOCOMPLETE_RANK_CACHE_TTL_SECONDS", "45").strip() or "45"
         )
         self.search_startup_warmup_queries = int(
-            os.getenv("SEARCH_STARTUP_WARMUP_QUERIES", "20").strip() or "20"
+            os.getenv("SEARCH_STARTUP_WARMUP_QUERIES", "0").strip() or "0"
         )
         self.state_snapshot_interval_ticks = int(
             os.getenv("STATE_SNAPSHOT_INTERVAL_TICKS", "6").strip() or "6"
@@ -254,7 +267,14 @@ class MusicCog(
         self.adaptive_search_latency_ms = float(os.getenv("ADAPTIVE_SEARCH_LATENCY_MS", "2000").strip() or "2000")
         self.adaptive_search_min_limit = int(os.getenv("ADAPTIVE_SEARCH_MIN_LIMIT", "2").strip() or "2")
         self.playlist_batch_ack_threshold = int(os.getenv("PLAYLIST_BATCH_ACK_THRESHOLD", "80").strip() or "80")
-        self.prefetch_lavalink_resolve_count = int(os.getenv("PREFETCH_LAVALINK_RESOLVE_COUNT", "2").strip() or "2")
+        LOGGER.info(
+            "playlist_limits max_import=%s initial_enqueue=%s chunk_size=%s batch_ack_threshold=%s incremental=%s",
+            self.max_playlist_import,
+            self.playlist_initial_enqueue,
+            self.playlist_incremental_chunk_size,
+            self.playlist_batch_ack_threshold,
+            self.playlist_incremental_enabled,
+        )
         self._button_debounce_until: dict[tuple[int, str], float] = {}
         self.rate_limit_channel_window_seconds = float(os.getenv("PLAY_CHANNEL_WINDOW_SECONDS", "10").strip() or "10")
         self.rate_limit_channel_max_requests = int(os.getenv("PLAY_CHANNEL_MAX_REQUESTS", "8").strip() or "8")
@@ -327,16 +347,18 @@ class MusicCog(
         )
         if self.control_room_status_interval_seconds < 2.0:
             self.control_room_status_interval_seconds = 2.0
-        self.lavalink_enabled = os.getenv("LAVALINK_ENABLED", "false").strip().casefold() in {"1", "true", "yes", "on"}
-        self.lavalink_host = os.getenv("LAVALINK_HOST", "lavalink").strip() or "lavalink"
-        self.lavalink_port = int((os.getenv("LAVALINK_PORT", "2333").strip() or "2333"))
-        self.lavalink_password = os.getenv("LAVALINK_PASSWORD", "youshallnotpass").strip() or "youshallnotpass"
-        self.lavalink_connect_attempts = int(getattr(bot, "lavalink_connect_attempts", 8))
-        self.lavalink_connect_base_delay_seconds = float(getattr(bot, "lavalink_connect_base_delay_seconds", 1.5))
-        self.voice_connect_timeout_seconds = float(getattr(bot, "voice_connect_timeout_seconds", 8.0))
-        self.lavalink_voice_timeout_cooldown_seconds = float(
-            getattr(bot, "lavalink_voice_timeout_cooldown_seconds", 300.0)
+        self.playback_watchdog_interval_seconds = float(
+            os.getenv("PLAYBACK_WATCHDOG_INTERVAL_SECONDS", "4").strip() or "4"
         )
+        if self.playback_watchdog_interval_seconds < 1.0:
+            self.playback_watchdog_interval_seconds = 1.0
+        self.playback_watchdog_stall_seconds = float(
+            os.getenv("PLAYBACK_WATCHDOG_STALL_SECONDS", "8").strip() or "8"
+        )
+        if self.playback_watchdog_stall_seconds < 3.0:
+            self.playback_watchdog_stall_seconds = 3.0
+        self.audio_backend = "native_ffmpeg"
+        self.voice_connect_timeout_seconds = float(getattr(bot, "voice_connect_timeout_seconds", 8.0))
         self.bot_healthcheck_enabled = bool(getattr(bot, "bot_healthcheck_enabled", True))
         self.bot_healthcheck_host = str(getattr(bot, "bot_healthcheck_host", "0.0.0.0"))
         self.bot_healthcheck_port = int(getattr(bot, "bot_healthcheck_port", 8090))
@@ -356,8 +378,6 @@ class MusicCog(
             self.play_backpressure_active_imports = 1
         if self.voice_connect_timeout_seconds < 2.0:
             self.voice_connect_timeout_seconds = 2.0
-        if self.lavalink_voice_timeout_cooldown_seconds < 10.0:
-            self.lavalink_voice_timeout_cooldown_seconds = 10.0
         self._provider_breakers: dict[str, CircuitBreaker] = {
             "extract": CircuitBreaker(
                 failure_threshold=max(self.provider_failure_threshold, 1),
@@ -369,15 +389,9 @@ class MusicCog(
                 recovery_seconds=max(self.provider_recovery_seconds, 1.0),
                 half_open_max_calls=max(self.provider_half_open_max_calls, 1),
             ),
-            "lavalink_search": CircuitBreaker(
-                failure_threshold=max(self.provider_failure_threshold, 1),
-                recovery_seconds=max(self.provider_recovery_seconds, 1.0),
-                half_open_max_calls=max(self.provider_half_open_max_calls, 1),
-            ),
         }
         self.search_pipeline = SearchPipeline(
             cache_timeout_seconds=float(os.getenv("SEARCH_PIPELINE_CACHE_TIMEOUT_SECONDS", "0.12").strip() or "0.12"),
-            lavalink_timeout_seconds=float(os.getenv("SEARCH_PIPELINE_LAVALINK_TIMEOUT_SECONDS", "1.6").strip() or "1.6"),
             resolver_timeout_seconds=self.search_timeout_seconds if self.search_timeout_seconds > 0 else 4.0,
         )
         self.guild_settings_repo = GuildSettingsRepository(self.store)
@@ -397,35 +411,87 @@ class MusicCog(
             max_entries=int(os.getenv("DNS_CACHE_MAX_ENTRIES", "128").strip() or "128"),
         )
         self._http_session: ClientSession | None = None
-        self._bind_direct_app_command_callables()
 
-    def _bind_direct_app_command_callables(self) -> None:
-        # Permite chamada direta em testes de regressao (cog.play(...), cog.search(...)).
-        for name in ("play", "playnext", "search", "queue"):
+    async def _initialize_runtime_state(self) -> None:
+        last_exc: Exception | None = None
+        for attempt in range(1, self._store_init_retry_attempts + 1):
             try:
-                current = object.__getattribute__(self, name)
-            except AttributeError:
-                continue
-            if isinstance(current, app_commands.Command):
-                bound = current.callback.__get__(self, type(self))
-                setattr(self, name, bound)
+                await self.store.initialize()
+                await self.store.cleanup_expired_votes(max_age_seconds=120, now_unix=int(time.time()))
+                await self._restore_search_cache_from_store()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= self._store_init_retry_attempts:
+                    break
+                LOGGER.exception(
+                    "Falha inicializando armazenamento do bot (tentativa %s/%s). Nova tentativa em %.1fs.",
+                    attempt,
+                    self._store_init_retry_attempts,
+                    self._store_init_retry_delay_seconds,
+                )
+                await asyncio.sleep(self._store_init_retry_delay_seconds)
+        if last_exc is not None:
+            raise last_exc
+
+    def _start_supervised_task(
+        self,
+        *,
+        attr_name: str,
+        label: str,
+        factory: Callable[[], Awaitable[None]],
+        restart_on_completion: bool,
+    ) -> asyncio.Task[None]:
+        existing = getattr(self, attr_name, None)
+        if isinstance(existing, asyncio.Task) and not existing.done():
+            return existing
+
+        async def runner() -> None:
+            while True:
+                try:
+                    await factory()
+                    if not restart_on_completion:
+                        return
+                    LOGGER.warning("Worker critico '%s' encerrou. Reiniciando em %.1fs.", label, self._critical_worker_restart_delay_seconds)
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    LOGGER.exception(
+                        "Worker critico '%s' falhou. Reiniciando em %.1fs.",
+                        label,
+                        self._critical_worker_restart_delay_seconds,
+                    )
+                await asyncio.sleep(self._critical_worker_restart_delay_seconds)
+
+        task = self.bot.loop.create_task(runner())
+        setattr(self, attr_name, task)
+        return task
+
+    async def _run_control_room_restore_worker(self) -> None:
+        await self.bot.wait_until_ready()
+        if self._control_room_restore_done:
+            return
+        await self._restore_control_room_panels()
+        self._control_room_restore_done = True
 
     async def cog_load(self) -> None:
-        await self.store.initialize()
-        await self.store.cleanup_expired_votes(max_age_seconds=120, now_unix=int(time.time()))
-        await self._restore_search_cache_from_store()
+        await self._initialize_runtime_state()
         await self._schedule_startup_warmup()
         self._http_session = ClientSession(timeout=ClientTimeout(total=6))
-        self._health_task = self.bot.loop.create_task(self._health_worker())
-        self._retention_task = self.bot.loop.create_task(self._retention_worker())
-        if self.lavalink_enabled:
-            if wavelink is None:
-                LOGGER.warning("LAVALINK_ENABLED=true, mas dependencia `wavelink` nao esta instalada. Usando fallback FFmpeg.")
-                self.lavalink_enabled = False
-            else:
-                connected = await self._connect_lavalink_with_retry()
-                if not connected:
-                    self.lavalink_enabled = False
+        self._start_supervised_task(
+            attr_name="_health_task",
+            label="health_worker",
+            factory=self._health_worker,
+            restart_on_completion=True,
+        )
+        self._start_supervised_task(
+            attr_name="_retention_task",
+            label="retention_worker",
+            factory=self._retention_worker,
+            restart_on_completion=True,
+        )
         if self.web_panel_enabled:
             await self._start_web_panel()
         if self.bot_healthcheck_enabled:
@@ -433,7 +499,17 @@ class MusicCog(
                 await self._start_healthcheck_endpoint()
             except Exception:
                 LOGGER.exception("Falha ao iniciar endpoint de healthcheck HTTP.")
-        await self._restore_control_room_panels()
+        self._schedule_control_room_restore()
+
+    def _schedule_control_room_restore(self) -> None:
+        if self._control_room_restore_done:
+            return
+        self._start_supervised_task(
+            attr_name="_control_room_restore_task",
+            label="control_room_restore",
+            factory=self._run_control_room_restore_worker,
+            restart_on_completion=False,
+        )
 
     def cog_unload(self) -> None:
         for guild_id in list(self._idle_tasks):
@@ -452,6 +528,13 @@ class MusicCog(
             if not task.done():
                 task.cancel()
             self._control_room_status_tasks.pop(guild_id, None)
+        for guild_id, task in list(self._playback_watchdog_tasks.items()):
+            if not task.done():
+                task.cancel()
+            self._playback_watchdog_tasks.pop(guild_id, None)
+        if self._control_room_restore_task and not self._control_room_restore_task.done():
+            self._control_room_restore_task.cancel()
+            self._control_room_restore_task = None
         if self._startup_warmup_task and not self._startup_warmup_task.done():
             self._startup_warmup_task.cancel()
             self._startup_warmup_task = None
@@ -784,6 +867,10 @@ class MusicCog(
         lowered = raw.casefold()
         return "list=" in lowered or "/playlist" in lowered
 
+    @staticmethod
+    def _playlist_has_pending_items(*, batch_total_items: int, extracted_count: int) -> bool:
+        return batch_total_items > extracted_count
+
     async def _enqueue_tracks_incrementally(
         self,
         guild: discord.Guild,
@@ -798,6 +885,13 @@ class MusicCog(
         skipped_capacity = 0
         skipped_chunk_failures = 0
         start = 0
+        LOGGER.info(
+            "playlist_incremental_begin guild=%s tracks=%s job_id=%s pending_before=%s",
+            guild.id,
+            len(tracks),
+            job_id,
+            len(player.snapshot_queue()),
+        )
         while start < len(tracks):
             chunk_size = self._effective_playlist_chunk_size(player)
             chunk = tracks[start : start + chunk_size]
@@ -808,21 +902,25 @@ class MusicCog(
                     lock = self._get_domain_lock(guild.id, "queue")
                     async with lock:
                         approved_tracks: list[Track] = []
+                        chunk_user_counts: dict[str, int] = {}
                         for track in chunk:
                             if not self._has_queue_capacity(player):
                                 skipped_capacity += 1
                                 continue
-                            if self.max_user_queue_items > 0 and not self._is_user_queue_within_limit(
-                                player,
-                                track.requested_by,
-                                incoming_items=1,
-                            ):
-                                skipped_capacity += 1
-                                continue
+                            if self.max_user_queue_items > 0:
+                                requester_key = track.requested_by.strip().casefold()
+                                pending = self._count_user_pending(player, track.requested_by)
+                                pending += chunk_user_counts.get(requester_key, 0)
+                                if (pending + 1) > self.max_user_queue_items:
+                                    skipped_capacity += 1
+                                    continue
                             if self._track_policy_error(guild.id, track):
                                 skipped_policy += 1
                                 continue
                             approved_tracks.append(track)
+                            requester_key = track.requested_by.strip().casefold()
+                            if requester_key:
+                                chunk_user_counts[requester_key] = chunk_user_counts.get(requester_key, 0) + 1
                         if approved_tracks:
                             added_chunk = await self.queue_service.enqueue_many(player, approved_tracks)
                         if added_chunk > 0:
@@ -849,6 +947,17 @@ class MusicCog(
                 self.playlist_jobs.update_progress(guild.id, job_id, added=added_chunk)
                 job = self.playlist_jobs.get(guild.id, job_id)
                 if job is not None:
+                    LOGGER.info(
+                        "playlist_incremental_chunk guild=%s job_id=%s start=%s chunk=%s added_chunk=%s total_added=%s job_added=%s pending_after=%s",
+                        guild.id,
+                        job.job_id,
+                        start,
+                        len(chunk),
+                        added_chunk,
+                        total_added,
+                        job.added,
+                        len(player.snapshot_queue()),
+                    )
                     self._log_event(
                         "playlist_job_progress",
                         guild=guild.id,
@@ -874,6 +983,17 @@ class MusicCog(
             )
         if job_id:
             self.playlist_jobs.finish(guild.id, job_id, "completed")
+            job = self.playlist_jobs.get(guild.id, job_id)
+            LOGGER.info(
+                "playlist_incremental_completed guild=%s job_id=%s total_added=%s job_added=%s skipped_policy=%s skipped_capacity=%s skipped_chunk_failures=%s",
+                guild.id,
+                job_id,
+                total_added,
+                job.added if job is not None else total_added,
+                skipped_policy,
+                skipped_capacity,
+                skipped_chunk_failures,
+            )
             self._log_event("playlist_job_completed", guild=guild.id, job_id=job_id, added=total_added)
         return total_added, skipped_policy, skipped_capacity + skipped_chunk_failures
 
@@ -940,6 +1060,8 @@ class MusicCog(
 
         async def worker() -> None:
             try:
+                if self.playlist_lazy_resolve_start_delay_seconds > 0:
+                    await asyncio.sleep(self.playlist_lazy_resolve_start_delay_seconds)
                 batch, _ = await self._extract_batch_with_spotify_fallback(
                     link=query,
                     requester=requester,
@@ -976,6 +1098,8 @@ class MusicCog(
     def _should_batch_ack_playlist(self, query: str, *, to_front: bool) -> bool:
         if to_front:
             return False
+        if self.playlist_incremental_enabled:
+            return False
         if not self.feature_flags.playlist_jobs_enabled:
             return False
         if not self._looks_like_playlist_query(query):
@@ -1003,6 +1127,15 @@ class MusicCog(
                 )
                 self.playlist_jobs.update_progress(guild.id, job_id, total=batch.total_items)
                 tracks = batch.tracks[: self.max_playlist_import]
+                LOGGER.info(
+                    "playlist_batch_ack_resolved guild=%s job_id=%s detected_total=%s extracted_tracks=%s capped_tracks=%s max_import=%s",
+                    guild.id,
+                    job_id,
+                    batch.total_items,
+                    len(batch.tracks),
+                    len(tracks),
+                    self.max_playlist_import,
+                )
                 for track in tracks:
                     track.requested_by = requester
                 await self._enqueue_tracks_incrementally(guild, tracks, text_channel, job_id=job_id)
@@ -1022,6 +1155,8 @@ class MusicCog(
 
     def _schedule_prefetch_next(self, guild_id: int, player: GuildPlayer) -> None:
         self._cancel_prefetch(guild_id)
+        if player.restored_queue_pending_activation:
+            return
         candidates = pick_prefetch_candidates(player, max_items=self.smart_prefetch_count)
         if not candidates:
             return
@@ -1034,68 +1169,12 @@ class MusicCog(
             try:
                 for track in candidates:
                     await self.music.prefetch_stream_url(track)
-                await self._prefetch_lavalink_playables(candidates[: max(self.prefetch_lavalink_resolve_count, 1)])
             except asyncio.CancelledError:
                 return
             except Exception:
                 LOGGER.debug("Prefetch falhou no guild %s", guild_id, exc_info=True)
 
         self._prefetch_tasks[guild_id] = self.bot.loop.create_task(worker())
-
-    def _cache_lavalink_playable(self, track: Track, playable: Any, *, ttl_seconds: float = 90.0) -> None:
-        key = self._track_key(track)
-        self._lavalink_playable_cache[key] = (time.monotonic() + max(ttl_seconds, 5.0), playable)
-        self._lavalink_playable_cache.move_to_end(key)
-        while len(self._lavalink_playable_cache) > 256:
-            self._lavalink_playable_cache.popitem(last=False)
-
-    def _consume_lavalink_playable_cache(self, track: Track) -> Any | None:
-        key = self._track_key(track)
-        cached = self._lavalink_playable_cache.get(key)
-        if cached is None:
-            return None
-        expires_at, playable = cached
-        if expires_at < time.monotonic():
-            self._lavalink_playable_cache.pop(key, None)
-            return None
-        self._lavalink_playable_cache.pop(key, None)
-        return playable
-
-    def _has_lavalink_playable_cache(self, track: Track) -> bool:
-        key = self._track_key(track)
-        cached = self._lavalink_playable_cache.get(key)
-        if cached is None:
-            return False
-        expires_at, _playable = cached
-        if expires_at < time.monotonic():
-            self._lavalink_playable_cache.pop(key, None)
-            return False
-        return True
-
-    @staticmethod
-    def _lavalink_play_identifier(track: Track) -> str:
-        source = (track.source_query or "").strip()
-        lowered = source.casefold()
-        if "open.spotify.com" in lowered or "music.apple.com" in lowered:
-            terms = f"{track.title} {track.artist or ''}".strip()
-            if terms:
-                return f"ytmsearch:{terms} audio"
-        return source or track.webpage_url or track.title
-
-    async def _prefetch_lavalink_playables(self, tracks: list[Track]) -> None:
-        if not self.lavalink_enabled or wavelink is None:
-            return
-        for track in tracks:
-            if self._has_lavalink_playable_cache(track):
-                continue
-            try:
-                identifier = self._lavalink_play_identifier(track)
-                search_result = await wavelink.Playable.search(identifier)
-                playable = search_result[0] if search_result else None
-                if playable is not None:
-                    self._cache_lavalink_playable(track, playable)
-            except Exception:
-                continue
 
     def _is_control_admin(self, interaction: discord.Interaction) -> bool:
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
@@ -1195,7 +1274,7 @@ class MusicCog(
                 "ok": True,
                 "ready": self.bot.is_ready(),
                 "guilds": len(self.bot.guilds),
-                "lavalink_enabled": self.lavalink_enabled,
+                "audio_backend": self.audio_backend,
                 "slo_5m": {
                     "play_p50_ms": self._command_metrics_window.percentile_ms("play", 50, window_seconds=300),
                     "play_p95_ms": self._command_metrics_window.percentile_ms("play", 95, window_seconds=300),
@@ -1223,37 +1302,6 @@ class MusicCog(
             await self._health_runner_http.cleanup()
             self._health_runner_http = None
 
-    async def _connect_lavalink_with_retry(self) -> bool:
-        attempts = max(self.lavalink_connect_attempts, 1)
-        base_delay = max(self.lavalink_connect_base_delay_seconds, 0.2)
-        for attempt in range(1, attempts + 1):
-            try:
-                resolved_host = self.lavalink_host
-                try:
-                    resolved_host = await self._dns_cache.resolve_ipv4(self.lavalink_host, self.lavalink_port)
-                except Exception:
-                    resolved_host = self.lavalink_host
-                node = wavelink.Node(  # type: ignore[union-attr]
-                    uri=f"http://{resolved_host}:{self.lavalink_port}",
-                    password=self.lavalink_password,
-                )
-                await wavelink.Pool.connect(nodes=[node], client=self.bot)  # type: ignore[union-attr]
-                LOGGER.info("Lavalink conectado em %s:%s (resolved=%s)", self.lavalink_host, self.lavalink_port, resolved_host)
-                return True
-            except Exception:
-                if attempt >= attempts:
-                    LOGGER.exception("Falha ao conectar no Lavalink apos %s tentativa(s). Mantendo fallback FFmpeg.", attempts)
-                    return False
-                delay = min(base_delay * (2 ** (attempt - 1)), 30.0)
-                LOGGER.warning(
-                    "Falha ao conectar no Lavalink (tentativa %s/%s). Nova tentativa em %.1fs",
-                    attempt,
-                    attempts,
-                    delay,
-                )
-                await asyncio.sleep(delay)
-        return False
-
     async def _clear_votes_for_guild(self, guild_id: int) -> None:
         for action in ("skip", "stop"):
             self._votes.pop((guild_id, action), None)
@@ -1279,6 +1327,7 @@ class MusicCog(
         player = await self._get_player(guild.id)
         lock = self._get_domain_lock(guild.id, "playback")
         async with lock:
+            await self._drop_restored_queue_if_idle(guild.id, player, reason="search_enqueue")
             if not self._has_queue_capacity(player):
                 await self._send_response(interaction, 
                     embed=self._warn_embed(
@@ -1345,13 +1394,7 @@ class MusicCog(
 
     def _set_player_state(self, guild_id: int, state: PlayerState, *, reason: str = "") -> None:
         self.player_state.transition(guild_id, state, reason=reason)
-        async def _persist_runtime_state() -> None:
-            try:
-                await self.store.upsert_player_runtime_state(guild_id, state.value, int(time.time()))
-            except Exception:
-                LOGGER.debug("Falha ao persistir player runtime state (guild=%s)", guild_id, exc_info=True)
-
-        self.bot.loop.create_task(_persist_runtime_state())
+        self.bot.loop.create_task(self.store.upsert_player_runtime_state(guild_id, state.value, int(time.time())))
 
     def _player_state_label(self, guild_id: int) -> str:
         return self.player_state.get(guild_id).state.value
@@ -1397,47 +1440,6 @@ class MusicCog(
         self._provider_success("extract")
         return result
 
-    async def _search_tracks_lavalink(self, query: str, *, requester: str, limit: int) -> list[Track]:
-        if not self.lavalink_enabled or wavelink is None:
-            return []
-        lowered = query.casefold()
-        # Lavalink nao suporta URL Spotify/Apple Music diretamente.
-        # Evita tentativa invalida para cair direto no resolver/fallback.
-        if "open.spotify.com" in lowered or "music.apple.com" in lowered:
-            return []
-        if not self._provider_available("lavalink_search"):
-            return []
-        try:
-            search_result = await wavelink.Playable.search(query)
-            tracks = list(search_result or [])
-            if not tracks:
-                return []
-            resolved: list[Track] = []
-            for item in tracks[: max(limit, 1)]:
-                duration_ms = int(getattr(item, "length", 0) or 0)
-                duration_seconds = duration_ms // 1000 if duration_ms > 0 else None
-                uri = str(getattr(item, "uri", "") or query)
-                title = str(getattr(item, "title", "") or query)
-                artist_raw = getattr(item, "author", None)
-                artist = str(artist_raw).strip() if artist_raw is not None else None
-                if artist == "":
-                    artist = None
-                resolved.append(
-                    Track(
-                        source_query=uri,
-                        title=title,
-                        webpage_url=uri,
-                        requested_by=requester,
-                        artist=artist,
-                        duration_seconds=duration_seconds,
-                    )
-                )
-            self._provider_success("lavalink_search")
-            return resolved
-        except Exception:
-            self._provider_failure("lavalink_search")
-            return []
-
     async def _search_tracks_guarded(
         self,
         query: str,
@@ -1472,9 +1474,6 @@ class MusicCog(
         async def resolver_lookup(req: SearchPipelineRequest) -> list[Track]:
             return await self.resolver.search_tracks(req.query, requester=req.requester, limit=req.limit)
 
-        async def lavalink_lookup(req: SearchPipelineRequest) -> list[Track]:
-            return await self._search_tracks_lavalink(req.query, requester=req.requester, limit=req.limit)
-
         async def cache_store(req: SearchPipelineRequest, tracks: list[Track]) -> None:
             if req.guild_id <= 0:
                 return
@@ -1486,7 +1485,6 @@ class MusicCog(
             result = await self.search_pipeline.run(
                 request,
                 cache_lookup=cache_lookup if guild_id > 0 else None,
-                lavalink_lookup=lavalink_lookup,
                 resolver_lookup=resolver_lookup,
                 cache_store=cache_store if guild_id > 0 else None,
             )
@@ -1508,7 +1506,6 @@ class MusicCog(
             "search_pipeline",
             source=result.source,
             cache_ms=f"{result.stage_latency_ms.get('cache', 0.0):.1f}",
-            lavalink_ms=f"{result.stage_latency_ms.get('lavalink', 0.0):.1f}",
             resolver_ms=f"{result.stage_latency_ms.get('resolver', 0.0):.1f}",
             limit=request.limit,
             guild=request.guild_id or "n/a",

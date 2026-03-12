@@ -23,11 +23,3 @@ spec:
           annotations:
             summary: "botmusica com reinicios frequentes"
             description: "Container botmusica reiniciou 3+ vezes nos ultimos 15 minutos."
-        - alert: LavalinkDeploymentUnavailable
-          expr: kube_deployment_status_replicas_available{namespace="botmusica",deployment="lavalink"} < 1
-          for: 5m
-          labels:
-            severity: critical
-          annotations:
-            summary: "lavalink indisponivel"
-            description: "Deployment lavalink sem replicas disponiveis por mais de 5 minutos."

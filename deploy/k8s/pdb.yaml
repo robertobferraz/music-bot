@@ -8,14 +8,3 @@ spec:
   selector:
     matchLabels:
       app: botmusica
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: lavalink-pdb
-  namespace: botmusica
-spec:
-  maxUnavailable: 0
-  selector:
-    matchLabels:
-      app: lavalink

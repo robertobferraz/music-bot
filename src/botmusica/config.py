@@ -68,9 +68,6 @@ class Settings:
     playlist_load_user_max_requests: int
     playlist_load_guild_window_seconds: float
     playlist_load_guild_max_requests: int
-    lavalink_connect_attempts: int
-    lavalink_connect_base_delay_seconds: float
-    lavalink_voice_timeout_cooldown_seconds: float
     bot_healthcheck_enabled: bool
     bot_healthcheck_host: str
     bot_healthcheck_port: int
@@ -249,8 +246,8 @@ def load_settings() -> Settings:
     if search_autocomplete_limit > 25:
         search_autocomplete_limit = 25
 
-    delete_after_raw = os.getenv("PUBLIC_MESSAGE_DELETE_AFTER_SECONDS", "30").strip()
-    public_message_delete_after_seconds = float(delete_after_raw) if delete_after_raw else 30.0
+    delete_after_raw = os.getenv("PUBLIC_MESSAGE_DELETE_AFTER_SECONDS", "60").strip()
+    public_message_delete_after_seconds = float(delete_after_raw) if delete_after_raw else 60.0
     if public_message_delete_after_seconds < 0:
         public_message_delete_after_seconds = 0.0
 
@@ -374,28 +371,6 @@ def load_settings() -> Settings:
     if playlist_load_guild_max_requests < 1:
         playlist_load_guild_max_requests = 1
 
-    lavalink_attempts_raw = os.getenv("LAVALINK_CONNECT_ATTEMPTS", "8").strip()
-    lavalink_connect_attempts = int(lavalink_attempts_raw) if lavalink_attempts_raw else 8
-    if lavalink_connect_attempts < 1:
-        lavalink_connect_attempts = 1
-    if lavalink_connect_attempts > 60:
-        lavalink_connect_attempts = 60
-
-    lavalink_base_delay_raw = os.getenv("LAVALINK_CONNECT_BASE_DELAY_SECONDS", "1.5").strip()
-    lavalink_connect_base_delay_seconds = float(lavalink_base_delay_raw) if lavalink_base_delay_raw else 1.5
-    if lavalink_connect_base_delay_seconds < 0.2:
-        lavalink_connect_base_delay_seconds = 0.2
-    if lavalink_connect_base_delay_seconds > 30:
-        lavalink_connect_base_delay_seconds = 30.0
-
-    lavalink_voice_timeout_cooldown_raw = os.getenv("LAVALINK_VOICE_TIMEOUT_COOLDOWN_SECONDS", "300").strip()
-    lavalink_voice_timeout_cooldown_seconds = (
-        float(lavalink_voice_timeout_cooldown_raw) if lavalink_voice_timeout_cooldown_raw else 300.0
-    )
-    if lavalink_voice_timeout_cooldown_seconds < 10:
-        lavalink_voice_timeout_cooldown_seconds = 10.0
-    if lavalink_voice_timeout_cooldown_seconds > 3600:
-        lavalink_voice_timeout_cooldown_seconds = 3600.0
 
     bot_healthcheck_enabled = os.getenv("BOT_HEALTHCHECK_ENABLED", "true").strip().casefold() in {"1", "true", "yes", "on"}
     bot_healthcheck_host = os.getenv("BOT_HEALTHCHECK_HOST", "0.0.0.0").strip() or "0.0.0.0"
@@ -495,9 +470,6 @@ def load_settings() -> Settings:
         playlist_load_user_max_requests=playlist_load_user_max_requests,
         playlist_load_guild_window_seconds=playlist_load_guild_window_seconds,
         playlist_load_guild_max_requests=playlist_load_guild_max_requests,
-        lavalink_connect_attempts=lavalink_connect_attempts,
-        lavalink_connect_base_delay_seconds=lavalink_connect_base_delay_seconds,
-        lavalink_voice_timeout_cooldown_seconds=lavalink_voice_timeout_cooldown_seconds,
         bot_healthcheck_enabled=bot_healthcheck_enabled,
         bot_healthcheck_host=bot_healthcheck_host,
         bot_healthcheck_port=bot_healthcheck_port,

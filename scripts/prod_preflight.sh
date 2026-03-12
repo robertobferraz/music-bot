@@ -20,7 +20,6 @@ extract_env_value() {
 required_vars=(
   "DISCORD_TOKEN"
   "BOT_REPOSITORY_BACKEND"
-  "LAVALINK_PASSWORD"
   "POSTGRES_PASSWORD"
 )
 
@@ -43,12 +42,6 @@ if [[ "$discord_token" == "seu_token_aqui" || "$discord_token" == "COLOQUE_SEU_T
 fi
 if [[ ${#discord_token} -lt 30 ]]; then
   echo "ERRO: DISCORD_TOKEN parece invalido (muito curto)."
-  exit 1
-fi
-
-lavalink_password="$(extract_env_value 'LAVALINK_PASSWORD')"
-if [[ "${lavalink_password}" == "youshallnotpass" || ${#lavalink_password} -lt 12 ]]; then
-  echo "ERRO: LAVALINK_PASSWORD insegura. Use senha forte (>=12) e nao use default."
   exit 1
 fi
 

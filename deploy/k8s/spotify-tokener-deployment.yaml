@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spotify-tokener
+  namespace: botmusica
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: spotify-tokener
+  template:
+    metadata:
+      labels:
+        app: spotify-tokener
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: spotify-tokener
+          image: ghcr.io/topi314/spotify-tokener:master
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SPOTIFY_TOKENER_ADDR
+              value: '0.0.0.0:7080'
+            - name: SPOTIFY_TOKENER_LOG_LEVEL
+              value: 'INFO'
+          ports:
+            - containerPort: 7080
+              name: http
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 6
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: '250m'
+              memory: '512Mi'
+            limits:
+              cpu: '1000m'
+              memory: '1536Mi'
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ['ALL']

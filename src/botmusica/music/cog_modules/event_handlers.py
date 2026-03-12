@@ -6,11 +6,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-try:
-    import wavelink
-except ImportError:
-    wavelink = None
-
 from botmusica.music.command_domains import command_domain
 
 
@@ -99,48 +94,4 @@ class EventHandlersMixin:
             error_type=type(error).__name__,
             error_code=error_code,
             error=error,
-        )
-
-    @commands.Cog.listener()
-    async def on_wavelink_track_end(self, payload: Any) -> None:
-        if not self.lavalink_enabled or wavelink is None:
-            return
-        player_obj = getattr(payload, "player", None)
-        if player_obj is None or not self._is_lavalink_player(player_obj):
-            return
-        guild = getattr(player_obj, "guild", None)
-        if guild is None:
-            return
-        player = await self._get_player(guild.id)
-        channel_id = self._last_text_channel_id.get(guild.id)
-        text_channel = guild.get_channel(channel_id) if channel_id else None
-        await self._apply_track_finished_state(
-            guild,
-            player,
-            text_channel,
-            playback_error=None,
-            finalize_queue_item=True,
-        )
-
-    @commands.Cog.listener()
-    async def on_wavelink_track_exception(self, payload: Any) -> None:
-        if not self.lavalink_enabled or wavelink is None:
-            return
-        player_obj = getattr(payload, "player", None)
-        if player_obj is None or not self._is_lavalink_player(player_obj):
-            return
-        guild = getattr(player_obj, "guild", None)
-        if guild is None:
-            return
-        exception_obj = getattr(payload, "exception", None)
-        message = getattr(exception_obj, "message", None) or "erro desconhecido no Lavalink"
-        player = await self._get_player(guild.id)
-        channel_id = self._last_text_channel_id.get(guild.id)
-        text_channel = guild.get_channel(channel_id) if channel_id else None
-        await self._apply_track_finished_state(
-            guild,
-            player,
-            text_channel,
-            playback_error=RuntimeError(str(message)),
-            finalize_queue_item=True,
         )

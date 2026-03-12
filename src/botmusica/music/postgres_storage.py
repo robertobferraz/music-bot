@@ -15,6 +15,7 @@ from botmusica.music.storage import (
     QueueEventRecord,
     QueueTrack,
     SearchCacheRecord,
+    SpotifyResolveCacheRecord,
     VoteStateRecord,
 )
 
@@ -192,6 +193,22 @@ class PostgresSettingsStore:
                     )
                     """
                 )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS spotify_resolve_cache (
+                        spotify_track_id TEXT PRIMARY KEY,
+                        status TEXT NOT NULL,
+                        source_query TEXT NOT NULL DEFAULT '',
+                        webpage_url TEXT NOT NULL DEFAULT '',
+                        title TEXT NOT NULL DEFAULT '',
+                        artist TEXT NOT NULL DEFAULT '',
+                        duration_seconds INTEGER NULL,
+                        isrc TEXT NOT NULL DEFAULT '',
+                        failure_reason TEXT NOT NULL DEFAULT '',
+                        cached_at_unix BIGINT NOT NULL
+                    )
+                    """
+                )
 
     async def get(self, guild_id: int) -> GuildSettings | None:
         return await asyncio.to_thread(self._get_sync, guild_id)
@@ -228,7 +245,7 @@ class PostgresSettingsStore:
                 """
                 INSERT INTO guild_settings
                 (guild_id, volume, loop_mode, autoplay, stay_connected, audio_filter, max_track_duration_seconds, domain_whitelist, domain_blacklist)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     volume = excluded.volume,
                     loop_mode = excluded.loop_mode,
@@ -388,16 +405,30 @@ class PostgresSettingsStore:
 
     def _save_queue_state_sync(self, guild_id: int, tracks: list[QueueTrack]) -> None:
         with self._conn() as conn:
-            conn.execute("DELETE FROM guild_queue_state WHERE guild_id = %s", (guild_id,))
+            max_position = 0
             for idx, track in enumerate(tracks, start=1):
+                max_position = idx
                 conn.execute(
                     """
                     INSERT INTO guild_queue_state
                     (guild_id, position, source_query, webpage_url, title, duration_seconds, requested_by)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT(guild_id, position) DO UPDATE SET
+                        source_query = excluded.source_query,
+                        webpage_url = excluded.webpage_url,
+                        title = excluded.title,
+                        duration_seconds = excluded.duration_seconds,
+                        requested_by = excluded.requested_by
                     """,
                     (guild_id, idx, track.source_query, track.webpage_url, track.title, track.duration_seconds, track.requested_by),
                 )
+            if max_position > 0:
+                conn.execute(
+                    "DELETE FROM guild_queue_state WHERE guild_id = %s AND position > %s",
+                    (guild_id, max_position),
+                )
+            else:
+                conn.execute("DELETE FROM guild_queue_state WHERE guild_id = %s", (guild_id,))
 
     async def load_queue_state(self, guild_id: int) -> list[QueueTrack]:
         return await asyncio.to_thread(self._load_queue_state_sync, guild_id)
@@ -771,6 +802,144 @@ class PostgresSettingsStore:
         cutoff = int(time.time()) - ttl
         with self._conn() as conn:
             cur = conn.execute("DELETE FROM guild_search_cache WHERE cached_at_unix < %s", (cutoff,))
+            return int(cur.rowcount)
+
+    async def get_spotify_resolve_cache(self, spotify_track_id: str) -> SpotifyResolveCacheRecord | None:
+        return await asyncio.to_thread(self._get_spotify_resolve_cache_sync, spotify_track_id)
+
+    def _get_spotify_resolve_cache_sync(self, spotify_track_id: str) -> SpotifyResolveCacheRecord | None:
+        spotify_id = spotify_track_id.strip()
+        if not spotify_id:
+            return None
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    spotify_track_id,
+                    status,
+                    source_query,
+                    webpage_url,
+                    title,
+                    artist,
+                    duration_seconds,
+                    isrc,
+                    failure_reason,
+                    cached_at_unix
+                FROM spotify_resolve_cache
+                WHERE spotify_track_id = %s
+                """,
+                (spotify_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SpotifyResolveCacheRecord(
+            spotify_track_id=str(row[0]),
+            status=str(row[1] or "miss"),
+            source_query=str(row[2] or ""),
+            webpage_url=str(row[3] or ""),
+            title=str(row[4] or ""),
+            artist=str(row[5] or ""),
+            duration_seconds=int(row[6]) if row[6] is not None else None,
+            isrc=str(row[7] or ""),
+            failure_reason=str(row[8] or ""),
+            cached_at_unix=int(row[9]),
+        )
+
+    async def upsert_spotify_resolve_cache(
+        self,
+        *,
+        spotify_track_id: str,
+        status: str,
+        source_query: str = "",
+        webpage_url: str = "",
+        title: str = "",
+        artist: str = "",
+        duration_seconds: int | None = None,
+        isrc: str = "",
+        failure_reason: str = "",
+        cached_at_unix: int | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self._upsert_spotify_resolve_cache_sync,
+            spotify_track_id,
+            status,
+            source_query,
+            webpage_url,
+            title,
+            artist,
+            duration_seconds,
+            isrc,
+            failure_reason,
+            cached_at_unix,
+        )
+
+    def _upsert_spotify_resolve_cache_sync(
+        self,
+        spotify_track_id: str,
+        status: str,
+        source_query: str,
+        webpage_url: str,
+        title: str,
+        artist: str,
+        duration_seconds: int | None,
+        isrc: str,
+        failure_reason: str,
+        cached_at_unix: int | None,
+    ) -> None:
+        spotify_id = spotify_track_id.strip()
+        cache_status = status.strip().casefold() or "miss"
+        if not spotify_id:
+            return
+        when = int(cached_at_unix) if cached_at_unix is not None else int(time.time())
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO spotify_resolve_cache (
+                    spotify_track_id,
+                    status,
+                    source_query,
+                    webpage_url,
+                    title,
+                    artist,
+                    duration_seconds,
+                    isrc,
+                    failure_reason,
+                    cached_at_unix
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(spotify_track_id) DO UPDATE SET
+                    status = excluded.status,
+                    source_query = excluded.source_query,
+                    webpage_url = excluded.webpage_url,
+                    title = excluded.title,
+                    artist = excluded.artist,
+                    duration_seconds = excluded.duration_seconds,
+                    isrc = excluded.isrc,
+                    failure_reason = excluded.failure_reason,
+                    cached_at_unix = excluded.cached_at_unix
+                """,
+                (
+                    spotify_id,
+                    cache_status,
+                    source_query.strip(),
+                    webpage_url.strip(),
+                    title.strip(),
+                    artist.strip(),
+                    int(duration_seconds) if duration_seconds is not None else None,
+                    isrc.strip(),
+                    failure_reason.strip(),
+                    when,
+                ),
+            )
+
+    async def prune_spotify_resolve_cache(self, *, max_age_seconds: int = 604800) -> int:
+        return await asyncio.to_thread(self._prune_spotify_resolve_cache_sync, max_age_seconds)
+
+    def _prune_spotify_resolve_cache_sync(self, max_age_seconds: int) -> int:
+        ttl = max(int(max_age_seconds), 60)
+        cutoff = int(time.time()) - ttl
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM spotify_resolve_cache WHERE cached_at_unix < %s", (cutoff,))
             return int(cur.rowcount)
 
     async def record_query_usage(self, guild_id: int, query: str) -> None:

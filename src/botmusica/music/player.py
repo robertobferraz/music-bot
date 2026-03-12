@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import re
 import shutil
+import tempfile
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -13,6 +15,8 @@ from urllib.parse import urlunparse
 
 import discord
 import yt_dlp
+
+LOGGER = __import__("logging").getLogger("botmusica.music")
 
 YTDL_OPTIONS: dict[str, Any] = {
     "format": "bestaudio[acodec^=opus]/bestaudio[ext=webm]/bestaudio/best",
@@ -26,6 +30,10 @@ YTDL_OPTIONS: dict[str, Any] = {
     "extractor_retries": 3,
     "fragment_retries": 5,
     "socket_timeout": 15,
+    "ignoreerrors": True,
+    # Evita ios por causa de PO Token, mas mantém android_vr como alternativa
+    # mais resiliente quando web retorna URLs SABR/403.
+    "extractor_args": {"youtube": {"player_client": ["android_vr", "web"]}},
 }
 
 BASE_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
@@ -46,6 +54,7 @@ class Track:
     requested_by: str
     artist: str | None = None
     duration_seconds: int | None = None
+    isrc: str | None = None
 
 
 @dataclass(slots=True)
@@ -70,6 +79,7 @@ class GuildPlayer:
         self.paused_accumulated_seconds: float = 0.0
         self.pending_seek_seconds: int = 0
         self.suppress_after_playback: bool = False
+        self.restored_queue_pending_activation: bool = False
 
     async def enqueue(self, track: Track) -> None:
         await self.queue.put(track)
@@ -140,6 +150,13 @@ class MusicService:
         cookies_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
         cookies_from_browser = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "").strip()
         js_runtime = os.getenv("YTDLP_JS_RUNTIME", "").strip()
+        if js_runtime:
+            runtime_name, _, runtime_path = js_runtime.partition(":")
+            runtime_name = runtime_name.strip()
+            runtime_path = runtime_path.strip()
+            if runtime_path and not os.path.exists(runtime_path):
+                LOGGER.warning("Ignorando YTDLP_JS_RUNTIME invalido: %s", js_runtime)
+                js_runtime = ""
         if not js_runtime:
             deno_path = shutil.which("deno")
             node_path = shutil.which("node")
@@ -147,6 +164,9 @@ class MusicService:
                 js_runtime = f"deno:{deno_path}"
             elif node_path:
                 js_runtime = f"node:{node_path}"
+
+        if cookies_file:
+            cookies_file = self._prepare_cookiefile(cookies_file)
 
         remote_components = os.getenv("YTDLP_REMOTE_COMPONENTS", "ejs:github").strip()
         ytdl_options = dict(YTDL_OPTIONS)
@@ -187,7 +207,7 @@ class MusicService:
         self._cache_max_entries = max(int(os.getenv("YTDLP_CACHE_MAX_ENTRIES", "512").strip() or "512"), 32)
         self._retry_delays: tuple[float, ...] = (0.0, 0.35) if self._fast_mode else (0.0, 0.8, 1.6)
         self._extract_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
-        self._stream_url_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
+        self._stream_url_cache: OrderedDict[str, tuple[float, str, dict[str, str]]] = OrderedDict()
         self._worker_concurrency = max(int(os.getenv("YTDLP_WORKER_CONCURRENCY", "2").strip() or "2"), 1)
         self._worker_queue_maxsize = max(int(os.getenv("YTDLP_WORKER_QUEUE_SIZE", "128").strip() or "128"), 16)
         self._extract_jobs: asyncio.Queue[tuple[yt_dlp.YoutubeDL, str, asyncio.Future[dict[str, Any]]]] | None = None
@@ -207,6 +227,20 @@ class MusicService:
             "spotify": asyncio.Semaphore(provider_limit),
             "other": asyncio.Semaphore(provider_limit),
         }
+
+    @staticmethod
+    def _prepare_cookiefile(cookiefile: str) -> str:
+        path = (cookiefile or "").strip()
+        if not path:
+            return path
+        if not os.path.exists(path):
+            return path
+        if os.access(path, os.W_OK):
+            return path
+        fd, writable_copy = tempfile.mkstemp(prefix="yt-dlp-cookies-", suffix=".txt")
+        os.close(fd)
+        shutil.copyfile(path, writable_copy)
+        return writable_copy
 
     def _ensure_extract_workers(self) -> asyncio.Queue[tuple[yt_dlp.YoutubeDL, str, asyncio.Future[dict[str, Any]]]]:
         queue = self._extract_jobs
@@ -296,23 +330,27 @@ class MusicService:
         while len(self._extract_cache) > self._cache_max_entries:
             self._extract_cache.popitem(last=False)
 
-    def _cache_get_stream_url(self, source_query: str) -> str | None:
+    def _cache_get_stream_url(self, source_query: str) -> tuple[str, dict[str, str]] | None:
         if self._stream_cache_ttl_seconds <= 0:
             return None
         cached = self._stream_url_cache.get(source_query)
         if cached is None:
             return None
-        expires_at, stream_url = cached
+        expires_at, stream_url, headers = cached
         if expires_at < time.monotonic():
             self._stream_url_cache.pop(source_query, None)
             return None
         self._stream_url_cache.move_to_end(source_query)
-        return stream_url
+        return stream_url, headers
 
-    def _cache_put_stream_url(self, source_query: str, stream_url: str) -> None:
+    def _cache_put_stream_url(self, source_query: str, stream_url: str, headers: dict[str, str] | None = None) -> None:
         if self._stream_cache_ttl_seconds <= 0:
             return
-        self._stream_url_cache[source_query] = (time.monotonic() + self._stream_cache_ttl_seconds, stream_url)
+        self._stream_url_cache[source_query] = (
+            time.monotonic() + self._stream_cache_ttl_seconds,
+            stream_url,
+            dict(headers or {}),
+        )
         self._stream_url_cache.move_to_end(source_query)
         while len(self._stream_url_cache) > self._cache_max_entries:
             self._stream_url_cache.popitem(last=False)
@@ -348,6 +386,10 @@ class MusicService:
     @staticmethod
     def _canonicalize_query_url(query: str) -> str:
         raw = (query or "").strip()
+        lowered = raw.casefold()
+        if lowered.startswith("ytmsearch:"):
+            terms = raw.split(":", 1)[1].strip()
+            return f"ytsearch5:{terms}" if terms else "ytsearch5:audio"
         if "://" not in raw:
             return raw
         try:
@@ -363,6 +405,68 @@ class MusicService:
             netloc = f"{netloc}:{parsed.port}"
         converted = parsed._replace(netloc=netloc)
         return urlunparse(converted)
+
+    @staticmethod
+    def _clean_search_terms(value: str) -> str:
+        cleaned = (value or "").strip()
+        cleaned = re.sub(r'"', ' ', cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"[\[\](){}|]+", " ", cleaned)
+        cleaned = re.sub(r"\b(feat|ft)\.?\b.*$", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(official|video|audio|lyrics|visualizer|remaster(?:ed)?)\b", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bde\s+toy\s+story\b", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_:")
+        return cleaned
+
+    @staticmethod
+    def _is_uploaderish_artist(value: str) -> bool:
+        lowered = (value or "").casefold()
+        if not lowered:
+            return False
+        return any(token in lowered for token in ("vevo", "topic", "records", "musicbr", "official"))
+
+    @classmethod
+    def _title_variants(cls, title: str, artist: str) -> list[str]:
+        variants: list[str] = []
+
+        def _add(value: str) -> None:
+            cleaned = cls._clean_search_terms(value)
+            if cleaned and cleaned not in variants:
+                variants.append(cleaned)
+
+        _add(title)
+        if " - " in title:
+            left, right = [part.strip() for part in title.split(" - ", 1)]
+            _add(right)
+            if artist and left.casefold() != artist.casefold():
+                _add(f"{left} {right}")
+        return variants
+
+    @classmethod
+    def _candidate_source_queries(cls, track: Track) -> list[str]:
+        primary = cls._canonicalize_query_url(track.source_query)
+        candidates: list[str] = []
+
+        def _add(value: str) -> None:
+            normalized = cls._canonicalize_query_url(value)
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+
+        _add(primary)
+        artist = cls._clean_search_terms(track.artist or "")
+        if cls._is_uploaderish_artist(artist):
+            artist = ""
+        titles = cls._title_variants(track.title, artist)
+        for title in titles:
+            if title and artist:
+                _add(f"ytsearch5:{title} {artist} audio")
+                _add(f"ytsearch5:{artist} {title} audio")
+            if title:
+                _add(f"ytsearch5:{title} audio")
+                _add(f"ytsearch5:{title}")
+        if artist and titles:
+            _add(f"ytsearch5:{artist} {titles[0]}".strip())
+        return candidates
 
     @staticmethod
     def _provider_key_from_query(query: str) -> str:
@@ -382,6 +486,110 @@ class MusicService:
         if entry is None:
             raise RuntimeError("Nenhum audio valido foi encontrado para esse item.")
         return entry
+
+    @classmethod
+    def _entry_source_queries_from_payload(cls, payload: dict[str, Any], fallback_query: str) -> list[str]:
+        entries = payload.get("entries")
+        if not isinstance(entries, list):
+            return []
+        queries: list[str] = []
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            candidate = cls._normalize_source_query(item, fallback_query)
+            candidate = cls._canonicalize_query_url(candidate)
+            if not candidate or candidate in queries:
+                continue
+            queries.append(candidate)
+        return queries
+
+    @staticmethod
+    def _headers_from_payload(payload: dict[str, Any]) -> dict[str, str]:
+        headers_raw = payload.get("http_headers")
+        if not isinstance(headers_raw, dict):
+            return {}
+        return {str(key): str(value) for key, value in headers_raw.items() if value is not None}
+
+    @staticmethod
+    def _format_client_tag(item: dict[str, Any]) -> str:
+        raw_url = item.get("url")
+        if not isinstance(raw_url, str) or not raw_url:
+            return ""
+        try:
+            parsed = urlparse(raw_url)
+        except ValueError:
+            return ""
+        return (parse_qs(parsed.query).get("c") or [""])[0].strip().upper()
+
+    @staticmethod
+    def _is_audio_capable_format(item: dict[str, Any]) -> bool:
+        if not isinstance(item, dict):
+            return False
+        if not item.get("url"):
+            return False
+        acodec = str(item.get("acodec") or "none").casefold()
+        vcodec = str(item.get("vcodec") or "none").casefold()
+        if acodec in {"", "none"}:
+            return False
+        # Ignora formatos de imagem/storyboard ou similares sem midia utilizavel.
+        if vcodec in {"mhtml"}:
+            return False
+        return True
+
+    @classmethod
+    def _format_preference_key(cls, item: dict[str, Any]) -> tuple[int, int, int, int, float, float]:
+        client_tag = cls._format_client_tag(item)
+        client_penalty = 1 if client_tag in {"", "WEB", "WEB_SAFARI"} else 0
+        vcodec_penalty = 1 if str(item.get("vcodec") or "none").casefold() != "none" else 0
+        acodec_penalty = 1 if str(item.get("acodec") or "").casefold() != "opus" else 0
+        ext_penalty = 1 if str(item.get("ext") or "").casefold() not in {"webm", "m4a"} else 0
+        abr = float(item.get("abr") or 0.0)
+        asr = float(item.get("asr") or 0.0)
+        return (client_penalty, vcodec_penalty, acodec_penalty, ext_penalty, -abr, -asr)
+
+    @classmethod
+    def _stream_from_payload(cls, payload: dict[str, Any]) -> tuple[str | None, dict[str, str]]:
+        requested_formats = payload.get("requested_formats")
+        if isinstance(requested_formats, list):
+            preferred_requested = sorted(
+                [item for item in requested_formats if cls._is_audio_capable_format(item)],
+                key=cls._format_preference_key,
+            )
+            audio_format = preferred_requested[0] if preferred_requested else None
+            if isinstance(audio_format, dict):
+                LOGGER.info(
+                    "build_audio_source selected requested_format id=%s acodec=%s vcodec=%s ext=%s client=%s",
+                    audio_format.get("format_id"),
+                    audio_format.get("acodec"),
+                    audio_format.get("vcodec"),
+                    audio_format.get("ext"),
+                    cls._format_client_tag(audio_format),
+                )
+                return str(audio_format.get("url") or ""), cls._headers_from_payload(audio_format)
+
+        formats = payload.get("formats")
+        if isinstance(formats, list):
+            audio_candidates: list[dict[str, Any]] = [
+                item
+                for item in formats
+                if cls._is_audio_capable_format(item)
+            ]
+            if audio_candidates:
+                preferred = sorted(audio_candidates, key=cls._format_preference_key)[0]
+                LOGGER.info(
+                    "build_audio_source selected format id=%s acodec=%s vcodec=%s ext=%s client=%s",
+                    preferred.get("format_id"),
+                    preferred.get("acodec"),
+                    preferred.get("vcodec"),
+                    preferred.get("ext"),
+                    cls._format_client_tag(preferred),
+                )
+                return str(preferred.get("url") or ""), cls._headers_from_payload(preferred)
+
+        direct_url = payload.get("url")
+        if isinstance(direct_url, str) and direct_url.strip():
+            return direct_url.strip(), cls._headers_from_payload(payload)
+        return None, {}
 
     @staticmethod
     def _normalize_source_query(data: dict[str, Any], fallback_query: str) -> str:
@@ -531,11 +739,17 @@ class MusicService:
         audio_filter: str,
         start_seconds: int,
         *,
-        hq_audio_enabled: bool = False,
+        hq_audio_enabled: bool = True,
+        request_headers: dict[str, str] | None = None,
     ) -> dict[str, str]:
         before_options = BASE_BEFORE_OPTIONS
         if start_seconds > 0:
             before_options = f"{before_options} -ss {start_seconds}"
+        if request_headers:
+            header_lines = "".join(f"{key}: {value}\r\n" for key, value in request_headers.items() if value)
+            if header_lines:
+                sanitized = header_lines.replace('"', '\\"')
+                before_options = f'{before_options} -headers "{sanitized}"'
 
         # Qualidade padrao: force stereo/48k para Discord.
         # Modo HQ usa resampler soxr para reduzir artefatos de transcodificacao.
@@ -565,24 +779,104 @@ class MusicService:
         audio_filter: str,
         start_seconds: int = 0,
     ) -> discord.AudioSource:
-        source_query = self._canonicalize_query_url(track.source_query)
-        stream_url = self._cache_get_stream_url(source_query)
+        source_queries = self._candidate_source_queries(track)
+        stream_url: str | None = None
+        request_headers: dict[str, str] = {}
+        last_error: Exception | None = None
+        resolved_query = source_queries[0]
+        for source_query in source_queries:
+            resolved_query = source_query
+            cached_stream = self._cache_get_stream_url(source_query)
+            if cached_stream:
+                stream_url, request_headers = cached_stream
+                break
+            try:
+                LOGGER.info(
+                    "build_audio_source attempt title=%s artist=%s query=%s",
+                    track.title,
+                    track.artist,
+                    source_query,
+                )
+                data = await self._extract_info_with_retry(
+                    self._ytdl,
+                    source_query,
+                    cache_key=f"stream:{source_query}",
+                )
+                search_entry_queries = self._entry_source_queries_from_payload(data, source_query)
+                if search_entry_queries:
+                    entry_error: Exception | None = None
+                    for entry_query in search_entry_queries:
+                        cached_entry_stream = self._cache_get_stream_url(entry_query)
+                        if cached_entry_stream:
+                            stream_url, request_headers = cached_entry_stream
+                            if entry_query != track.source_query:
+                                track.source_query = entry_query
+                            break
+                        try:
+                            entry_data = await self._extract_info_with_retry(
+                                self._ytdl,
+                                entry_query,
+                                cache_key=f"stream:{entry_query}",
+                            )
+                            data = self._extract_entry(entry_data)
+                            source_query = entry_query
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            entry_error = exc
+                            continue
+                    if stream_url:
+                        break
+                    if search_entry_queries and entry_error is not None and "entries" in data:
+                        raise entry_error
+                data = self._extract_entry(data)
+                if not track.duration_seconds:
+                    duration_raw = data.get("duration")
+                    if isinstance(duration_raw, (int, float)) and duration_raw > 0:
+                        track.duration_seconds = int(duration_raw)
+                artist_raw = (
+                    data.get("artist")
+                    or data.get("uploader")
+                    or data.get("channel")
+                    or data.get("creator")
+                    or data.get("uploader_id")
+                    or None
+                )
+                if not track.artist and artist_raw is not None:
+                    artist = str(artist_raw).strip()
+                    if artist:
+                        track.artist = artist
+                page_url = self._normalize_source_query(data, source_query)
+                if page_url:
+                    track.webpage_url = page_url
+                title_raw = str(data.get("title") or "").strip()
+                if title_raw:
+                    track.title = title_raw
+                stream_url, request_headers = self._stream_from_payload(data)
+                if not stream_url:
+                    raise RuntimeError("O provedor nao retornou uma URL de stream valida.")
+                self._cache_put_stream_url(source_query, stream_url, request_headers)
+                if source_query != track.source_query:
+                    track.source_query = source_query
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                LOGGER.warning(
+                    "build_audio_source failed title=%s artist=%s query=%s",
+                    track.title,
+                    track.artist,
+                    source_query,
+                    exc_info=True,
+                )
         if not stream_url:
-            data = await self._extract_info_with_retry(
-                self._ytdl,
-                source_query,
-                cache_key=f"stream:{source_query}",
-            )
-            data = self._extract_entry(data)
-            stream_url = data.get("url")
-            if not stream_url:
-                raise RuntimeError("O provedor nao retornou uma URL de stream valida.")
-            self._cache_put_stream_url(source_query, stream_url)
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError(f"Nao foi possivel resolver stream para {resolved_query}.")
 
         ffmpeg_options = self._build_ffmpeg_options(
             audio_filter=audio_filter,
             start_seconds=start_seconds,
             hq_audio_enabled=self._hq_audio_enabled,
+            request_headers=request_headers,
         )
         base_source = discord.FFmpegPCMAudio(stream_url, **ffmpeg_options)
         return discord.PCMVolumeTransformer(base_source, volume=volume)
@@ -594,10 +888,10 @@ class MusicService:
             return
         data = await self._extract_info_with_retry(self._ytdl, source_query, cache_key=f"stream:{source_query}")
         data = self._extract_entry(data)
-        stream_url = data.get("url")
+        stream_url, headers = self._stream_from_payload(data)
         if stream_url:
-            self._cache_put_stream_url(source_query, stream_url)
+            self._cache_put_stream_url(source_query, stream_url, headers)
 
     async def extract_recommended_track(self, from_track: Track, requester: str) -> Track:
-        query = f"ytsearch1:{from_track.title} audio"
+        query = f"ytsearch5:{from_track.title} audio"
         return await self.extract_track(query, requester=requester)

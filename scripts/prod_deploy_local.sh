@@ -21,5 +21,5 @@ for _ in {1..45}; do
 done
 
 echo "Falha: /health nao respondeu no tempo esperado."
-docker compose logs --tail=120 botmusica lavalink postgres || true
+docker compose logs --tail=120 botmusica postgres || true
 exit 1

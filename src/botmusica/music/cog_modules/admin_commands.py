@@ -8,11 +8,6 @@ import shutil
 import discord
 from discord import app_commands
 
-try:
-    import wavelink
-except ImportError:
-    wavelink = None
-
 from botmusica.music.views import ControlRoomView, HelpView
 from botmusica.music.storage import ControlRoomStateRecord
 
@@ -20,6 +15,95 @@ LOGGER = logging.getLogger("botmusica.music")
 
 
 class AdminCommandsMixin:
+    def _is_control_room_panel_message(self, message: discord.Message) -> bool:
+        bot_user_id = getattr(getattr(self.bot, "user", None), "id", 0)
+        if not message.author or message.author.id != bot_user_id:
+            return False
+        if not message.embeds:
+            return False
+        title = (message.embeds[0].title or "").strip()
+        return title in {"🎛️ Control Room", "🎛️ Central de Comandos"}
+
+    async def _find_control_room_panel_message(
+        self,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+        *,
+        expected_message_id: int | None = None,
+    ) -> discord.Message | None:
+        candidate_ids: list[int] = []
+        if expected_message_id:
+            candidate_ids.append(int(expected_message_id))
+        cached = self._control_room_state_cache.get(guild.id)
+        if cached and cached[0] == channel.id and cached[1] not in candidate_ids:
+            candidate_ids.append(int(cached[1]))
+
+        for message_id in candidate_ids:
+            try:
+                message = await channel.fetch_message(message_id)
+            except Exception:
+                continue
+            if self._is_control_room_panel_message(message):
+                return message
+
+        # Retomada rapida: reaproveita a ultima mensagem do bot no canal quando ela ja for o painel.
+        try:
+            bot_user_id = getattr(getattr(self.bot, "user", None), "id", 0)
+            async for message in channel.history(limit=10):
+                if not message.author or message.author.id != bot_user_id:
+                    continue
+                if self._is_control_room_panel_message(message):
+                    return message
+                break
+        except Exception:
+            return None
+
+        try:
+            async for message in channel.history(limit=50):
+                if self._is_control_room_panel_message(message):
+                    return message
+        except Exception:
+            return None
+        return None
+
+    async def _upsert_control_room_panel_message(
+        self,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+        *,
+        operator_id: int,
+        expected_message_id: int | None = None,
+        pin_reason: str,
+    ) -> tuple[discord.Message, int]:
+        embed = await self._build_control_room_embed(guild)
+        view = ControlRoomView(self, guild.id, operator_user_id=operator_id)
+        reused = await self._find_control_room_panel_message(
+            guild,
+            channel,
+            expected_message_id=expected_message_id,
+        )
+        if reused is not None:
+            message = await reused.edit(embed=embed, view=view)
+            reused_count = 1
+        else:
+            message = await channel.send(embed=embed, view=view)
+            reused_count = 0
+        try:
+            await message.pin(reason=pin_reason)
+        except Exception:
+            pass
+        await self.store.upsert_control_room_state(
+            ControlRoomStateRecord(
+                guild_id=guild.id,
+                channel_id=channel.id,
+                message_id=message.id,
+                operator_user_id=operator_id,
+            )
+        )
+        self._control_room_state_cache[guild.id] = (channel.id, message.id)
+        self.bot.add_view(ControlRoomView(self, guild.id, operator_user_id=operator_id), message_id=message.id)
+        return message, reused_count
+
     async def _reject_if_admin_slash_disabled(self, interaction: discord.Interaction, command_name: str) -> bool:
         if self.admin_slash_enabled:
             warned = getattr(self, "_admin_slash_deprecation_seen", set())
@@ -92,48 +176,22 @@ class AdminCommandsMixin:
             merged_overwrites.update(overwrites)
             await channel.edit(topic=topic, overwrites=merged_overwrites, reason="Padronizacao da sala control_room")
 
-        bot_user_id = getattr(getattr(self.bot, "user", None), "id", 0)
-        panel_titles = {"🎛️ Control Room", "🎛️ Central de Comandos"}
-        removed_panels = 0
-        try:
-            async for message in channel.history(limit=200):
-                if not message.author or message.author.id != bot_user_id:
-                    continue
-                if not message.embeds:
-                    continue
-                title = (message.embeds[0].title or "").strip()
-                if title not in panel_titles:
-                    continue
-                try:
-                    await message.delete()
-                    removed_panels += 1
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
         self._control_room_operator[guild.id] = operator_id
         self._control_room_push_history(guild.id, f"{actor_label} abriu/controlou a central")
-        view = ControlRoomView(self, guild.id, operator_user_id=operator_id)
-        embed = await self._build_control_room_embed(guild)
-        panel_message = await channel.send(embed=embed, view=view)
-        try:
-            await panel_message.pin(reason="Painel central do bot")
-        except Exception:
-            pass
-        await self.store.upsert_control_room_state(
-            ControlRoomStateRecord(
-                guild_id=guild.id,
-                channel_id=channel.id,
-                message_id=panel_message.id,
-                operator_user_id=operator_id,
-            )
+        panel_message, reused_existing = await self._upsert_control_room_panel_message(
+            guild,
+            channel,
+            operator_id=operator_id,
+            pin_reason="Painel central do bot",
         )
-        self._control_room_state_cache[guild.id] = (channel.id, panel_message.id)
-        self.bot.add_view(ControlRoomView(self, guild.id, operator_user_id=operator_id), message_id=panel_message.id)
         self._schedule_control_room_status_updater(guild.id)
         await self._upsert_voice_mini_panel(guild, channel, reason="control_room_bootstrap")
-        return {"created": created, "removed_panels": removed_panels, "channel_id": channel.id, "message_id": panel_message.id}
+        return {
+            "created": created,
+            "reused_panel": reused_existing,
+            "channel_id": channel.id,
+            "message_id": panel_message.id,
+        }
 
     async def _upsert_voice_mini_panel(
         self,
@@ -299,10 +357,11 @@ class AdminCommandsMixin:
         self._control_room_status_tasks[guild_id] = self.bot.loop.create_task(worker())
 
     async def _restore_control_room_panels(self) -> None:
+        restored_guild_ids: set[int] = set()
         try:
             rows = await self.store.list_control_room_states()
         except Exception:
-            return
+            rows = []
         for row in rows:
             guild = self.bot.get_guild(row.guild_id)
             if guild is None:
@@ -318,20 +377,12 @@ class AdminCommandsMixin:
             if message is None:
                 # auto-repair no startup
                 try:
-                    embed = await self._build_control_room_embed(guild)
-                    view = ControlRoomView(self, guild.id, operator_user_id=row.operator_user_id)
-                    message = await channel.send(embed=embed, view=view)
-                    try:
-                        await message.pin(reason="Painel central do bot (auto-repair)")
-                    except Exception:
-                        pass
-                    await self.store.upsert_control_room_state(
-                        ControlRoomStateRecord(
-                            guild_id=guild.id,
-                            channel_id=channel.id,
-                            message_id=message.id,
-                            operator_user_id=row.operator_user_id,
-                        )
+                    message, _ = await self._upsert_control_room_panel_message(
+                        guild,
+                        channel,
+                        operator_id=int(row.operator_user_id),
+                        expected_message_id=row.message_id,
+                        pin_reason="Painel central do bot (auto-repair)",
                     )
                 except Exception:
                     continue
@@ -339,6 +390,86 @@ class AdminCommandsMixin:
             self._control_room_operator[guild.id] = int(row.operator_user_id)
             self.bot.add_view(ControlRoomView(self, guild.id, operator_user_id=int(row.operator_user_id)), message_id=message.id)
             self._schedule_control_room_status_updater(guild.id)
+            restored_guild_ids.add(guild.id)
+            LOGGER.info(
+                "control_room startup_restore guild=%s channel=%s message=%s",
+                guild.id,
+                channel.id,
+                message.id,
+            )
+
+        # Fallback de startup: se existir a sala/painel no Discord, reaproveita mesmo sem estado persistido.
+        for guild in self.bot.guilds:
+            if guild.id in restored_guild_ids:
+                continue
+            LOGGER.info("control_room startup_scan guild=%s channels=%s", guild.id, len(guild.text_channels))
+            channel: discord.TextChannel | None = None
+            panel_message: discord.Message | None = None
+            preferred = discord.utils.get(guild.text_channels, name="bot-controle")
+            candidate_channels: list[discord.TextChannel] = []
+            if isinstance(preferred, discord.TextChannel):
+                candidate_channels.append(preferred)
+            candidate_channels.extend(
+                text_channel
+                for text_channel in guild.text_channels
+                if preferred is None or text_channel.id != preferred.id
+            )
+            for candidate in candidate_channels:
+                try:
+                    panel_message = await asyncio.wait_for(
+                        self._find_control_room_panel_message(guild, candidate),
+                        timeout=2.0,
+                    )
+                except asyncio.TimeoutError:
+                    LOGGER.warning(
+                        "control_room startup_scan_timeout guild=%s channel=%s",
+                        guild.id,
+                        candidate.id,
+                    )
+                    continue
+                except Exception:
+                    LOGGER.warning(
+                        "control_room startup_scan_error guild=%s channel=%s",
+                        guild.id,
+                        candidate.id,
+                        exc_info=True,
+                    )
+                    continue
+                if panel_message is None:
+                    continue
+                channel = candidate
+                break
+            if channel is None:
+                LOGGER.info("control_room startup_scan_miss guild=%s", guild.id)
+                continue
+            LOGGER.info(
+                "control_room startup_scan_hit guild=%s channel=%s message=%s",
+                guild.id,
+                channel.id,
+                panel_message.id if panel_message else 0,
+            )
+            if panel_message is None:
+                continue
+            operator_id = int(self._control_room_operator.get(guild.id, 0))
+            try:
+                message, reused_existing = await self._upsert_control_room_panel_message(
+                    guild,
+                    channel,
+                    operator_id=operator_id,
+                    expected_message_id=panel_message.id,
+                    pin_reason="Painel central do bot (startup-sync)",
+                )
+            except Exception:
+                continue
+            self._control_room_state_cache[guild.id] = (channel.id, message.id)
+            self._control_room_operator[guild.id] = operator_id
+            self._schedule_control_room_status_updater(guild.id)
+            LOGGER.info(
+                "control_room startup_sync guild=%s channel=%s reused=%s",
+                guild.id,
+                channel.id,
+                reused_existing,
+            )
 
     async def _recreate_control_room_panel(self, guild_id: int) -> bool:
         state = await self.store.get_control_room_state(guild_id)
@@ -356,24 +487,14 @@ class AdminCommandsMixin:
             return False
         operator_id = int(state.operator_user_id)
         self._control_room_operator[guild_id] = operator_id
-        embed = await self._build_control_room_embed(guild)
-        view = ControlRoomView(self, guild_id, operator_user_id=operator_id)
         try:
-            message = await channel.send(embed=embed, view=view)
-            try:
-                await message.pin(reason="Painel central do bot (auto-repair)")
-            except Exception:
-                pass
-            await self.store.upsert_control_room_state(
-                ControlRoomStateRecord(
-                    guild_id=guild_id,
-                    channel_id=channel.id,
-                    message_id=message.id,
-                    operator_user_id=operator_id,
-                )
+            message, _ = await self._upsert_control_room_panel_message(
+                guild,
+                channel,
+                operator_id=operator_id,
+                expected_message_id=state.message_id,
+                pin_reason="Painel central do bot (auto-repair)",
             )
-            self._control_room_state_cache[guild_id] = (channel.id, message.id)
-            self.bot.add_view(ControlRoomView(self, guild_id, operator_user_id=operator_id), message_id=message.id)
             self._schedule_control_room_status_updater(guild_id)
             return True
         except Exception:
@@ -413,7 +534,7 @@ class AdminCommandsMixin:
                 "Sala de controle pronta",
                 (
                     f"{'Canal criado' if result['created'] else 'Canal reutilizado'}: <#{result['channel_id']}>\n"
-                    f"Painel publicado e fixado. Paineis antigos removidos: `{result['removed_panels']}`.\n"
+                    f"Painel {'reaproveitado e atualizado' if result['reused_panel'] else 'publicado e fixado'}.\n"
                     f"Operador atual: <@{operator_id}>."
                 ),
             ),
@@ -633,16 +754,12 @@ class AdminCommandsMixin:
         ffmpeg_path = shutil.which("ffmpeg") or "nao encontrado"
         deno_path = shutil.which("deno") or "nao encontrado"
         node_path = shutil.which("node") or "nao encontrado"
-        lavalink_enabled = os.getenv("LAVALINK_ENABLED", "false").strip().casefold() in {"1", "true", "yes", "on"}
-        lavalink_host = os.getenv("LAVALINK_HOST", "lavalink").strip() or "lavalink"
-        lavalink_port = os.getenv("LAVALINK_PORT", "2333").strip() or "2333"
         discord_ping_ms = getattr(self.bot, "latency", 0.0) * 1000
         search_avg = self._command_metrics_window.avg_ms("search", window_seconds=300)
         play_avg = self._command_metrics_window.avg_ms("play", window_seconds=300)
         search_p99 = self._command_metrics_window.percentile_ms("search", 99, window_seconds=300)
         play_p99 = self._command_metrics_window.percentile_ms("play", 99, window_seconds=300)
         search_cache_stage_avg = self._avg_stage_latency_ms("cache")
-        search_lavalink_stage_avg = self._avg_stage_latency_ms("lavalink")
         search_resolver_stage_avg = self._avg_stage_latency_ms("resolver")
         player = self.music.get_player(guild_id) if guild_id else None
         queue_size = len(player.snapshot_queue()) if player is not None else 0
@@ -650,17 +767,6 @@ class AdminCommandsMixin:
         jobs_queue = getattr(self.music, "_extract_jobs", None)
         worker_backlog = jobs_queue.qsize() if jobs_queue is not None else 0
         workers_total = len(getattr(self.music, "_extract_workers", []))
-
-        lavalink_status = "off"
-        lavalink_nodes = 0
-        lavalink_players = 0
-        if wavelink is not None:
-            pool = getattr(wavelink, "Pool", None)
-            nodes = getattr(pool, "nodes", {}) if pool is not None else {}
-            if isinstance(nodes, dict):
-                lavalink_nodes = len(nodes)
-                lavalink_players = sum(len(getattr(node, "players", {})) for node in nodes.values())
-                lavalink_status = "connected" if lavalink_nodes > 0 else "connecting"
 
         embed = self._embed(
             "🧪 Diagnostico",
@@ -685,8 +791,7 @@ class AdminCommandsMixin:
                 f"• Bind: `{self.web_panel_host}:{self.web_panel_port}`\n"
                 f"• Repository: `{getattr(self.bot, 'repository_backend', 'sqlite')}`\n"
                 f"• DB: `{getattr(self.bot, 'db_path', 'botmusica.db')}`\n"
-                f"• Lavalink cfg: `{'on' if lavalink_enabled else 'off'}` (`{lavalink_host}:{lavalink_port}`)\n"
-                f"• Lavalink pool: `{lavalink_status}` nodes=`{lavalink_nodes}` players=`{lavalink_players}`"
+                "• Audio backend: `native_ffmpeg`"
             ),
             inline=False,
         )
@@ -698,7 +803,7 @@ class AdminCommandsMixin:
                 f"• /search avg: `{search_avg:.1f} ms`\n"
                 f"• /search p99: `{search_p99:.1f} ms`\n"
                 f"• Search stage avg: cache=`{search_cache_stage_avg:.1f} ms` "
-                f"lavalink=`{search_lavalink_stage_avg:.1f} ms` resolver=`{search_resolver_stage_avg:.1f} ms`\n"
+                f"resolver=`{search_resolver_stage_avg:.1f} ms`\n"
                 f"• Queue atual: `{queue_size}`\n"
                 f"• Search cache (mem): `{in_memory_cache}` entradas\n"
                 f"• Workers yt-dlp: `{workers_total}` backlog=`{worker_backlog}`"
@@ -722,8 +827,7 @@ class AdminCommandsMixin:
             name="Provider Circuit",
             value=(
                 f"extract=`{self._provider_breakers['extract'].state}` "
-                f"search=`{self._provider_breakers['search'].state}` "
-                f"lavalink_search=`{self._provider_breakers['lavalink_search'].state}`"
+                f"search=`{self._provider_breakers['search'].state}`"
             ),
             inline=False,
         )

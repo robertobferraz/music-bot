@@ -438,7 +438,6 @@ def build_web_panel_html() -> str:
       <div class="nodes">
         <p class="nav-title">Runtime</p>
         <div class="node"><span class="sig ok"></span> Backend: <strong id="side-backend">-</strong></div>
-        <div class="node"><span class="sig warn"></span> Lavalink: <strong id="side-lavalink">-</strong></div>
         <div class="node"><span class="sig bad"></span> Servidores: <strong id="side-guilds">0</strong></div>
       </div>
     </aside>
@@ -469,7 +468,6 @@ def build_web_panel_html() -> str:
         <article class="card"><div class="k">Latência</div><div id="avg-latency" class="v">0.0 ms</div></article>
         <article class="card"><div class="k">Uptime</div><div id="uptime" class="v">0s</div></article>
         <article class="card"><div class="k">Backend</div><div id="runtime-backend" class="v">-</div></article>
-        <article class="card"><div class="k">Lavalink</div><div id="lavalink-mode" class="v">-</div></article>
         <article class="card"><div class="k">Play p95 / p99</div><div class="v"><span id="p95-play">0.0</span> / <span id="p99-play">0.0</span></div></article>
         <article class="card"><div class="k">Search p95 / p99</div><div class="v"><span id="p95-search">0.0</span> / <span id="p99-search">0.0</span></div></article>
         <article class="card"><div class="k">Play p50</div><div id="p50-play" class="v">0.0 ms</div></article>
@@ -599,8 +597,16 @@ def build_web_panel_html() -> str:
         <article class="form-card">
           <h3>Admin Center</h3>
           <label>Control Room (canal)</label>
-          <input id="control-room-name" type="text" placeholder="bot-controle">
+          <input id="control-room-name" type="text" placeholder="🎼música🎼">
           <button id="control-room-btn" class="btn admin-only" type="button">Criar/Atualizar central</button>
+
+          <label style="margin-top:7px">Setup cargo DJ (usuario opcional)</label>
+          <input id="dj-user-id" type="text" inputmode="numeric" placeholder="ID do usuario (opcional)">
+          <button id="setup-dj-role-btn" class="btn admin-only" type="button">Criar cargo DJ</button>
+          <div class="log" style="margin-top:7px">
+            <strong>Status cargo DJ</strong>
+            <div id="dj-role-status" class="k" style="margin-top:5px">Nao verificado.</div>
+          </div>
 
           <label style="margin-top:7px">Max duração (seg)</label>
           <input id="mod-duration" type="number" min="0">
@@ -645,11 +651,9 @@ def build_web_panel_html() -> str:
       botUser: document.getElementById("bot-user"), guildsTotal: document.getElementById("guilds-total"),
       commandCalls: document.getElementById("command-calls"), commandErrors: document.getElementById("command-errors"),
       avgLatency: document.getElementById("avg-latency"), uptime: document.getElementById("uptime"),
-      runtimeBackend: document.getElementById("runtime-backend"), lavalinkMode: document.getElementById("lavalink-mode"),
       p95Play: document.getElementById("p95-play"), p99Play: document.getElementById("p99-play"),
       p95Search: document.getElementById("p95-search"), p99Search: document.getElementById("p99-search"),
       p50Play: document.getElementById("p50-play"), p50Search: document.getElementById("p50-search"),
-      sideBackend: document.getElementById("side-backend"), sideLavalink: document.getElementById("side-lavalink"), sideGuilds: document.getElementById("side-guilds"),
       guildList: document.getElementById("guild-list"), guildSearch: document.getElementById("guild-search"), guildSelect: document.getElementById("guild-select"),
       refreshBtn: document.getElementById("refresh-btn"), selectedRole: document.getElementById("selected-role"),
       guildState: document.getElementById("guild-state"), guildVoice: document.getElementById("guild-voice"), guildQueue: document.getElementById("guild-queue"),
@@ -664,6 +668,8 @@ def build_web_panel_html() -> str:
       setAutoplayBtn: document.getElementById("set-autoplay-btn"), setStayBtn: document.getElementById("set-stay-btn"),
       removeBtn: document.getElementById("remove-btn"), moveBtn: document.getElementById("move-btn"), jumpBtn: document.getElementById("jump-btn"),
       controlRoomName: document.getElementById("control-room-name"), controlRoomBtn: document.getElementById("control-room-btn"),
+      djUserId: document.getElementById("dj-user-id"), setupDjRoleBtn: document.getElementById("setup-dj-role-btn"),
+      djRoleStatus: document.getElementById("dj-role-status"),
       modDuration: document.getElementById("mod-duration"), modDurationBtn: document.getElementById("mod-duration-btn"),
       modWhitelist: document.getElementById("mod-whitelist"), modWhitelistAdd: document.getElementById("mod-whitelist-add"), modWhitelistRemove: document.getElementById("mod-whitelist-remove"), modWhitelistClear: document.getElementById("mod-whitelist-clear"),
       modBlacklist: document.getElementById("mod-blacklist"), modBlacklistAdd: document.getElementById("mod-blacklist-add"), modBlacklistRemove: document.getElementById("mod-blacklist-remove"), modBlacklistClear: document.getElementById("mod-blacklist-clear"),
@@ -759,6 +765,7 @@ def build_web_panel_html() -> str:
         refs.guildWave.classList.remove('playing');
         refs.guildWave.classList.add('paused');
         refs.queuePreview.innerHTML='<li class="k">Fila vazia.</li>';
+        refs.djRoleStatus.textContent='Nao verificado.';
         return;
       }
       refs.guildState.innerHTML=`${badge(g)} <span class="k">${esc(g.player_state||'unknown')}</span>`;
@@ -780,6 +787,12 @@ def build_web_panel_html() -> str:
       const m=g.moderation||{};
       refs.guildModeration.textContent=`max=${m.max_track_duration_seconds||0}s | wl=${(m.whitelist||[]).length} | bl=${(m.blacklist||[]).length}`;
       refs.modDuration.value=String(m.max_track_duration_seconds||0);
+      const dj = g.dj_role || { exists: false };
+      if (dj.exists) {
+        refs.djRoleStatus.textContent = `Existe | id=${dj.role_id || '0'} | admin=${dj.administrator ? 'on' : 'off'} | hoist=${dj.hoist ? 'on' : 'off'} | mentionable=${dj.mentionable ? 'on' : 'off'} | cor=${dj.color || '#000000'}`;
+      } else {
+        refs.djRoleStatus.textContent = 'Nao existe no servidor selecionado.';
+      }
       const elapsed = Number(g.current_elapsed_seconds || 0);
       const total = Number(g.current_duration_seconds || 0);
       const ratio = total > 0 ? Math.min(100, Math.max(0, (elapsed / total) * 100)) : 0;
@@ -801,9 +814,7 @@ def build_web_panel_html() -> str:
       refs.avgLatency.textContent=`${fmtMs(payload.metrics?.average_latency_ms)} ms`;
       refs.uptime.textContent=fmtUptime(payload.runtime?.uptime_seconds);
       refs.runtimeBackend.textContent=payload.runtime?.repository_backend||'-';
-      refs.lavalinkMode.textContent=payload.runtime?.lavalink_enabled?'enabled':'fallback';
       refs.sideBackend.textContent=payload.runtime?.repository_backend||'-';
-      refs.sideLavalink.textContent=payload.runtime?.lavalink_enabled?'enabled':'fallback';
       refs.sideGuilds.textContent=String(guilds.length);
       const slo=payload.metrics?.slo_5m||{};
       refs.p95Play.textContent=fmtMs(slo.play_p95_ms);
@@ -853,6 +864,8 @@ def build_web_panel_html() -> str:
         const j=await r.json();
         if(!r.ok||!j.ok){ log(`Falha: ${j.error||('status '+r.status)}`); return; }
         log(`OK: ${action}` + (j.summary?` | ${j.summary}`:''));
+        if (j.message) { log(j.message); }
+        if (j.assign_message) { log(`Atribuicao DJ: ${j.assign_message}`); }
         if(j.moderation){ log(`Moderation: ${JSON.stringify(j.moderation)}`); }
         if(j.diagnostics){ log(`Diagnostics: ${JSON.stringify(j.diagnostics)}`); }
         await tick();
@@ -888,7 +901,19 @@ def build_web_panel_html() -> str:
     refs.moveBtn.addEventListener('click',()=>callAction('move',{source_pos:Number(refs.moveSource.value||'0'),target_pos:Number(refs.moveTarget.value||'0')}));
     refs.jumpBtn.addEventListener('click',()=>callAction('jump',{position:Number(refs.jumpPosition.value||'0')}));
 
-    refs.controlRoomBtn.addEventListener('click',()=>callAction('control_room_create',{name:refs.controlRoomName.value||'bot-controle'}));
+    refs.controlRoomBtn.addEventListener('click',()=>callAction('control_room_create',{name:refs.controlRoomName.value||'🎼música🎼'}));
+    refs.setupDjRoleBtn.addEventListener('click',()=>{
+      const rawId = String(refs.djUserId.value || '').trim();
+      if (rawId.length > 0) {
+        if (!/^\\d+$/.test(rawId)) {
+          log('ID invalido: informe apenas numeros.');
+          return;
+        }
+        callAction('music_role_setup',{target_user_id: rawId});
+        return;
+      }
+      callAction('music_role_setup');
+    });
     refs.modDurationBtn.addEventListener('click',()=>callAction('moderation_set_duration',{seconds:Number(refs.modDuration.value||'0')}));
     refs.modWhitelistAdd.addEventListener('click',()=>callAction('moderation_add_whitelist',{domain:refs.modWhitelist.value||''}));
     refs.modWhitelistRemove.addEventListener('click',()=>callAction('moderation_remove_whitelist',{domain:refs.modWhitelist.value||''}));

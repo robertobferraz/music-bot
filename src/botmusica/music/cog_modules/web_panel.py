@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 import discord
 from aiohttp import web
+from discord.errors import DiscordException, Forbidden, HTTPException, NotFound
 
 from botmusica.music.player import FILTERS
 from botmusica.music.services.web_auth import (
@@ -58,13 +59,65 @@ class WebPanelMixin:
             and self.web_panel_session_secret
         )
         session_cookie_name = "bm_panel_session"
+        role_cache_ttl_seconds = 120.0
+        role_cache: dict[int, tuple[str, float]] = {}
 
-        def role_for_user(user_id: int) -> str:
+        async def role_for_user(user_id: int) -> str:
             if user_id in self.web_panel_admin_user_ids:
                 return "admin"
             if user_id in self.web_panel_dj_user_ids:
                 return "dj"
-            return "viewer"
+            cached = role_cache.get(user_id)
+            now = time.monotonic()
+            if cached and cached[1] > now:
+                return cached[0]
+            resolved = "viewer"
+            for guild in self.bot.guilds:
+                member = guild.get_member(user_id)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(user_id)
+                    except (NotFound, Forbidden):
+                        continue
+                    except (HTTPException, DiscordException):
+                        LOGGER.debug(
+                            "Falha ao resolver membro %s no guild %s para auth do painel.",
+                            user_id,
+                            guild.id,
+                            exc_info=True,
+                        )
+                        continue
+                permissions = member.guild_permissions
+                if permissions.administrator:
+                    resolved = "admin"
+                    break
+                if permissions.manage_channels:
+                    resolved = "dj"
+            role_cache[user_id] = (resolved, now + role_cache_ttl_seconds)
+            if resolved != "viewer":
+                LOGGER.info("Painel web OAuth: uid=%s promovido para role=%s por permissao no Discord.", user_id, resolved)
+            else:
+                LOGGER.info("Painel web OAuth: uid=%s sem permissao de admin/dj; role=viewer.", user_id)
+                LOGGER.info(
+                    "Configure WEB_PANEL_ADMIN_USER_IDS/WEB_PANEL_DJ_USER_IDS para liberar acesso manual no painel."
+                )
+            return resolved
+
+        async def resolve_identity(request: web.Request) -> tuple[str, int | None, str]:
+            if validate_admin_token(request, self.web_panel_admin_token):
+                return "admin", None, "token"
+            if not oauth_enabled:
+                return "viewer", None, "none"
+            raw_cookie = request.cookies.get(session_cookie_name, "")
+            if not raw_cookie:
+                return "viewer", None, "oauth_missing"
+            session_data = parse_signed_session_cookie(self.web_panel_session_secret, raw_cookie)
+            if not session_data:
+                return "viewer", None, "oauth_invalid"
+            uid = int(session_data.get("uid", 0) or 0)
+            if uid <= 0:
+                return "viewer", None, "oauth_invalid"
+            return await role_for_user(uid), uid, "oauth"
 
         def allowed_for_role(role: str, action: str) -> bool:
             admin_only = {
@@ -107,27 +160,11 @@ class WebPanelMixin:
                 return role in {"admin", "dj"}
             return False
 
-        def resolve_identity(request: web.Request) -> tuple[str, int | None, str]:
-            if validate_admin_token(request, self.web_panel_admin_token):
-                return "admin", None, "token"
-            if not oauth_enabled:
-                return "viewer", None, "none"
-            raw_cookie = request.cookies.get(session_cookie_name, "")
-            if not raw_cookie:
-                return "viewer", None, "oauth_missing"
-            session_data = parse_signed_session_cookie(self.web_panel_session_secret, raw_cookie)
-            if not session_data:
-                return "viewer", None, "oauth_invalid"
-            uid = int(session_data.get("uid", 0) or 0)
-            if uid <= 0:
-                return "viewer", None, "oauth_invalid"
-            return role_for_user(uid), uid, "oauth"
-
         async def health(_request: web.Request) -> web.Response:
             return web.json_response({"ok": True})
 
         async def auth_me(request: web.Request) -> web.Response:
-            role, user_id, source = resolve_identity(request)
+            role, user_id, source = await resolve_identity(request)
             authed = role in {"admin", "dj"} if oauth_enabled else bool(self.web_panel_admin_token)
             return web.json_response(
                 {
@@ -273,7 +310,7 @@ class WebPanelMixin:
             return web.Response(text="\n".join(lines) + "\n", content_type="text/plain")
 
         async def api_status(request: web.Request) -> web.Response:
-            role, user_id, source = resolve_identity(request)
+            role, user_id, source = await resolve_identity(request)
             guilds: list[dict[str, Any]] = []
             for guild in self.bot.guilds:
                 player = await self._get_player(guild.id)
@@ -345,7 +382,7 @@ class WebPanelMixin:
                     "runtime": {
                         "uptime_seconds": int(max(time.monotonic() - self._boot_started_mono, 0.0)),
                         "repository_backend": str(getattr(self.bot, "repository_backend", "sqlite")),
-                        "lavalink_enabled": bool(self.lavalink_enabled),
+                        "audio_backend": "native_ffmpeg",
                         "admin_slash_enabled": bool(self.admin_slash_enabled),
                     },
                     "guilds": guilds,
@@ -378,7 +415,7 @@ class WebPanelMixin:
                 return web.json_response({"ok": False, "error": "invalid_payload"}, status=400)
 
             action = str(payload.get("action") or "").strip().casefold()
-            role, _user_id, _source = resolve_identity(request)
+            role, _user_id, _source = await resolve_identity(request)
             if not allowed_for_role(role, action):
                 return web.json_response({"ok": False, "error": "forbidden"}, status=403)
 
@@ -481,7 +518,7 @@ class WebPanelMixin:
                         "diagnostics": {
                             "ffmpeg": ffmpeg,
                             "opus_loaded": bool(discord.opus.is_loaded()),
-                            "lavalink_enabled": bool(self.lavalink_enabled),
+                            "audio_backend": "native_ffmpeg",
                             "avg_play_ms_5m": self._command_metrics_window.avg_ms("play", window_seconds=300),
                             "avg_search_ms_5m": self._command_metrics_window.avg_ms("search", window_seconds=300),
                             "queue_size": len(player.snapshot_queue()),

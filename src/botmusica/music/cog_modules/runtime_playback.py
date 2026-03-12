@@ -1,15 +1,12 @@
 from __future__ import annotations
+# pyright: reportAttributeAccessIssue=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportOptionalMemberAccess=false
+# mypy: disable-error-code=attr-defined
 
 import asyncio
 import logging
 import time
 
 import discord
-
-try:
-    import wavelink
-except ImportError:
-    wavelink = None
 
 from botmusica.music.player import GuildPlayer, Track
 from botmusica.music.services.player_state import PlayerState
@@ -18,6 +15,71 @@ LOGGER = logging.getLogger("botmusica.music")
 
 
 class RuntimePlaybackMixin:
+    def _cancel_playback_watchdog(self, guild_id: int) -> None:
+        task = self._playback_watchdog_tasks.pop(guild_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    def _schedule_playback_watchdog(
+        self,
+        guild: discord.Guild,
+        text_channel: discord.abc.Messageable | None,
+    ) -> None:
+        existing = self._playback_watchdog_tasks.get(guild.id)
+        if existing is not None and not existing.done():
+            return
+
+        async def worker() -> None:
+            while True:
+                try:
+                    await asyncio.sleep(self.playback_watchdog_interval_seconds)
+                    voice_client = guild.voice_client
+                    if voice_client is None or not self._is_voice_connected(voice_client):
+                        return
+                    player = await self._get_player(guild.id)
+                    if player.current is None:
+                        return
+                    state_entry = self.player_state.get(guild.id)
+                    if state_entry.state in {
+                        PlayerState.CONNECTING,
+                        PlayerState.BUFFERING,
+                        PlayerState.RECOVERING,
+                    }:
+                        continue
+                    if guild.id in self._voice_reconnect_required:
+                        continue
+                    if self._is_voice_playing(voice_client) or self._is_voice_paused(voice_client):
+                        continue
+                    if player.current_started_at is None:
+                        continue
+                    stalled_for = time.monotonic() - player.current_started_at
+                    if stalled_for < self.playback_watchdog_stall_seconds:
+                        continue
+                    LOGGER.warning(
+                        "Playback watchdog detectou sessao travada no guild %s (stall=%.1fs).",
+                        guild.id,
+                        stalled_for,
+                    )
+                    self._log_event("playback_watchdog_detected", guild=guild.id, stall_seconds=f"{stalled_for:.1f}")
+                    self._mark_voice_reconnect_required(guild.id)
+                    refreshed = await self._force_voice_session_refresh(guild, voice_client)
+                    if refreshed is None or not self._is_voice_session_usable(guild, refreshed):
+                        self._log_event("playback_watchdog_refresh_failed", guild=guild.id)
+                        self._set_player_state(guild.id, PlayerState.RECOVERING, reason="watchdog_refresh_failed")
+                        continue
+                    recovered = await self._recover_playback_after_reconnect(guild, text_channel)
+                    if recovered:
+                        self._log_event("playback_watchdog_recover_ok", guild=guild.id)
+                        continue
+                    self._log_event("playback_watchdog_recover_failed", guild=guild.id)
+                    self._set_player_state(guild.id, PlayerState.ERROR, reason="watchdog_recover_failed")
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    LOGGER.exception("Playback watchdog falhou no guild %s", guild.id)
+
+        self._playback_watchdog_tasks[guild.id] = self.bot.loop.create_task(worker())
+
     def _mini_panel_channel(
         self,
         guild: discord.Guild,
@@ -32,22 +94,6 @@ class RuntimePlaybackMixin:
             return fallback
         return None
 
-    def _lavalink_voice_in_cooldown(self, guild_id: int) -> bool:
-        retry_after = self._lavalink_voice_retry_after.get(guild_id, 0.0)
-        return time.monotonic() < retry_after
-
-    @staticmethod
-    def _lavalink_play_identifier(track: Track) -> str:
-        source = (track.source_query or "").strip()
-        lowered = source.casefold()
-        # Lavalink nao reproduz URL Spotify/Apple Music diretamente.
-        # Para esses casos, usa busca textual como fallback robusto.
-        if "open.spotify.com" in lowered or "music.apple.com" in lowered:
-            terms = f"{track.title} {track.artist or ''}".strip()
-            if terms:
-                return f"ytmsearch:{terms} audio"
-        return source or track.webpage_url or track.title
-
     def _cancel_idle_timer(self, guild_id: int) -> None:
         task = self._idle_tasks.pop(guild_id, None)
         if task and not task.done():
@@ -58,10 +104,6 @@ class RuntimePlaybackMixin:
 
     def _clear_voice_reconnect_required(self, guild_id: int) -> None:
         self._voice_reconnect_required.discard(guild_id)
-
-    @staticmethod
-    def _is_lavalink_player(voice_client: discord.VoiceClient | None) -> bool:
-        return bool(wavelink is not None and voice_client is not None and isinstance(voice_client, wavelink.Player))
 
     async def _wait_voice_state_sync(
         self,
@@ -78,45 +120,9 @@ class RuntimePlaybackMixin:
             await asyncio.sleep(0.1)
         return False
 
-    def _should_force_fresh_lavalink_session(
-        self,
-        guild: discord.Guild,
-        voice_client: discord.VoiceClient | None,
-    ) -> bool:
-        if not self._is_lavalink_player(voice_client):
-            return False
-        if self._is_voice_playing(voice_client) or self._is_voice_paused(voice_client):
-            return False
-        entry = self.player_state.get(guild.id)
-        player_state = getattr(entry, "state", entry)
-        if not isinstance(player_state, PlayerState):
-            try:
-                player_state = PlayerState(str(player_state))
-            except Exception:
-                return False
-        # Usa tupla (nao set) para evitar path de hash caso venha tipo inesperado.
-        if player_state in (PlayerState.PLAYING, PlayerState.PAUSED, PlayerState.BUFFERING):
-            return False
-        return True
-
     def _is_voice_connected(self, voice_client: discord.VoiceClient | None) -> bool:
         if voice_client is None:
             return False
-        if self._is_lavalink_player(voice_client):
-            guild = getattr(voice_client, "guild", None)
-            channel = getattr(voice_client, "channel", None)
-            if hasattr(voice_client, "connected"):
-                connected = bool(getattr(voice_client, "connected"))
-            else:
-                connected = bool(getattr(voice_client, "_connected", False))
-            if not connected:
-                return False
-            if guild is not None and isinstance(channel, discord.VoiceChannel):
-                me = guild.me
-                if me is None or me.voice is None or me.voice.channel is None:
-                    return False
-                return me.voice.channel.id == channel.id
-            return connected
         return voice_client.is_connected()
 
     def _is_voice_session_usable(self, guild: discord.Guild, voice_client: discord.VoiceClient | None) -> bool:
@@ -135,44 +141,23 @@ class RuntimePlaybackMixin:
     def _is_voice_playing(self, voice_client: discord.VoiceClient | None) -> bool:
         if voice_client is None:
             return False
-        if self._is_lavalink_player(voice_client):
-            if bool(getattr(voice_client, "paused", False)):
-                return False
-            if hasattr(voice_client, "playing"):
-                return bool(getattr(voice_client, "playing"))
-            return getattr(voice_client, "current", None) is not None
         return voice_client.is_playing()
 
     def _is_voice_paused(self, voice_client: discord.VoiceClient | None) -> bool:
         if voice_client is None:
             return False
-        if self._is_lavalink_player(voice_client):
-            return bool(getattr(voice_client, "paused", False))
         return voice_client.is_paused()
 
     async def _pause_voice(self, voice_client: discord.VoiceClient) -> None:
-        if self._is_lavalink_player(voice_client):
-            await voice_client.pause(True)
-            return
         voice_client.pause()
 
     async def _resume_voice(self, voice_client: discord.VoiceClient) -> None:
-        if self._is_lavalink_player(voice_client):
-            await voice_client.pause(False)
-            return
         voice_client.resume()
 
     async def _stop_voice(self, voice_client: discord.VoiceClient) -> None:
-        if self._is_lavalink_player(voice_client):
-            await voice_client.stop()
-            return
         voice_client.stop()
 
     async def _set_voice_volume(self, voice_client: discord.VoiceClient, normalized: float) -> None:
-        if self._is_lavalink_player(voice_client):
-            percent = max(1, min(int(round(normalized * 100)), 1000))
-            await voice_client.set_volume(percent)
-            return
         if isinstance(voice_client.source, discord.PCMVolumeTransformer):
             voice_client.source.volume = normalized
 
@@ -232,6 +217,7 @@ class RuntimePlaybackMixin:
         await self._persist_queue_state(guild.id, player)
         self._schedule_prefetch_next(guild.id, player)
         if player.queue.empty() and player.current is None:
+            self._cancel_playback_watchdog(guild.id)
             self._set_player_state(guild.id, PlayerState.IDLE, reason="track_finished")
         await self._start_next_if_needed(guild, text_channel)
 
@@ -261,6 +247,7 @@ class RuntimePlaybackMixin:
                 await self._clear_nowplaying_message(guild.id)
                 await self._clear_voice_mini_panel(guild.id)
                 await self._clear_votes_for_guild(guild.id)
+                self._cancel_playback_watchdog(guild.id)
                 self.music.remove_player(guild.id)
                 self._loaded_settings.discard(guild.id)
                 self._set_player_state(guild.id, PlayerState.IDLE, reason="idle_disconnect")
@@ -280,18 +267,6 @@ class RuntimePlaybackMixin:
         if not voice_state or not isinstance(voice_state.channel, discord.VoiceChannel):
             return None
         return voice_state.channel
-
-    async def _cleanup_partial_lavalink_voice(self, guild: discord.Guild) -> None:
-        partial = guild.voice_client
-        if partial is None or not self._is_lavalink_player(partial):
-            return
-        if self._is_voice_session_usable(guild, partial):
-            return
-        try:
-            await partial.disconnect(force=True)
-        except Exception:
-            LOGGER.debug("Falha ao limpar sessao parcial de voz Lavalink no guild %s", guild.id, exc_info=True)
-        await asyncio.sleep(0.15)
 
     async def _connect_native_voice_with_retry(
         self,
@@ -351,8 +326,7 @@ class RuntimePlaybackMixin:
                 native_connected = existing.is_connected() if hasattr(existing, "is_connected") else False
             except Exception:
                 native_connected = False
-            lavalink_connected = bool(getattr(existing, "connected", False) or getattr(existing, "_connected", False))
-            if native_connected or lavalink_connected:
+            if native_connected:
                 self._clear_voice_reconnect_required(guild.id)
                 self._set_player_state(guild.id, PlayerState.IDLE, reason="voice_reused_same_channel")
                 try:
@@ -383,63 +357,6 @@ class RuntimePlaybackMixin:
             return existing
 
         self._set_player_state(guild.id, PlayerState.CONNECTING, reason="joining_voice")
-        now = time.monotonic()
-        lavalink_retry_after = self._lavalink_voice_retry_after.get(guild.id, 0.0)
-        can_try_lavalink_voice = self.lavalink_enabled and wavelink is not None and now >= lavalink_retry_after
-        if can_try_lavalink_voice:
-            try:
-                connected = await user_channel.connect(
-                    cls=wavelink.Player,
-                    self_deaf=True,
-                    timeout=self.voice_connect_timeout_seconds,
-                )
-                synced = await self._wait_voice_state_sync(guild, user_channel, timeout_seconds=3.2)
-                if not synced or not self._is_voice_session_usable(guild, connected):
-                    raise RuntimeError("Sessao Lavalink conectou sem sincronizar estado de voz no Discord.")
-                self._lavalink_voice_retry_after.pop(guild.id, None)
-                self._clear_voice_reconnect_required(guild.id)
-                self._set_player_state(guild.id, PlayerState.IDLE, reason="voice_joined_lavalink")
-                try:
-                    target = self._mini_panel_channel(guild, interaction.channel)
-                    await self._upsert_voice_mini_panel(guild, target, reason="voice_joined_lavalink")
-                except Exception:
-                    LOGGER.debug("Falha ao atualizar mini painel (voice_joined_lavalink) no guild %s", guild.id, exc_info=True)
-                return connected
-            except Exception:
-                late_connected = guild.voice_client
-                if self._is_lavalink_player(late_connected):
-                    late_synced = await self._wait_voice_state_sync(guild, user_channel, timeout_seconds=1.6)
-                    if late_synced and self._is_voice_session_usable(guild, late_connected):
-                        self._lavalink_voice_retry_after.pop(guild.id, None)
-                        self._clear_voice_reconnect_required(guild.id)
-                        self._set_player_state(guild.id, PlayerState.IDLE, reason="voice_joined_lavalink_late")
-                        try:
-                            target = self._mini_panel_channel(guild, interaction.channel)
-                            await self._upsert_voice_mini_panel(guild, target, reason="voice_joined_lavalink_late")
-                        except Exception:
-                            LOGGER.debug(
-                                "Falha ao atualizar mini painel (voice_joined_lavalink_late) no guild %s",
-                                guild.id,
-                                exc_info=True,
-                            )
-                        return late_connected
-                self._lavalink_voice_retry_after[guild.id] = (
-                    time.monotonic() + self.lavalink_voice_timeout_cooldown_seconds
-                )
-                await self._cleanup_partial_lavalink_voice(guild)
-                LOGGER.warning(
-                    "Falha ao conectar player Lavalink no canal em %.1fs. Recuando para FFmpeg por %.0fs.",
-                    self.voice_connect_timeout_seconds,
-                    self.lavalink_voice_timeout_cooldown_seconds,
-                    exc_info=True,
-                )
-        elif self.lavalink_enabled and wavelink is not None:
-            remaining = max(lavalink_retry_after - now, 0.0)
-            LOGGER.info(
-                "Pulando tentativa de voz via Lavalink no guild %s por cooldown de %.1fs. Usando FFmpeg.",
-                guild.id,
-                remaining,
-            )
         fallback_existing = guild.voice_client
         if fallback_existing is not None and not self._is_voice_session_usable(guild, fallback_existing):
             try:
@@ -457,59 +374,17 @@ class RuntimePlaybackMixin:
         return connected
 
     def _mark_track_ffmpeg_fallback(self, guild_id: int, track: Track) -> None:
-        self._lavalink_track_failures[guild_id].add(self._track_key(track))
+        return
 
     def _consume_track_ffmpeg_fallback(self, guild_id: int, track: Track) -> bool:
-        key = self._track_key(track)
-        marked = key in self._lavalink_track_failures.get(guild_id, set())
-        if marked:
-            self._lavalink_track_failures[guild_id].discard(key)
-        return marked
+        return False
 
     async def _switch_voice_to_ffmpeg(
         self,
         guild: discord.Guild,
         voice_client: discord.VoiceClient,
     ) -> discord.VoiceClient | None:
-        channel = getattr(voice_client, "channel", None)
-        if not isinstance(channel, discord.VoiceChannel):
-            return None
-        try:
-            await voice_client.disconnect(force=True)
-        except Exception:
-            LOGGER.debug("Falha ao desconectar Lavalink para fallback FFmpeg", exc_info=True)
-        return await channel.connect(self_deaf=True)
-
-    async def _switch_voice_to_lavalink(
-        self,
-        guild: discord.Guild,
-        voice_client: discord.VoiceClient,
-    ) -> discord.VoiceClient | None:
-        if not self.lavalink_enabled or wavelink is None:
-            return voice_client
-        if self._lavalink_voice_in_cooldown(guild.id):
-            return voice_client
-        if self._is_lavalink_player(voice_client):
-            return voice_client
-        channel = getattr(voice_client, "channel", None)
-        if not isinstance(channel, discord.VoiceChannel):
-            return voice_client
-        try:
-            await voice_client.disconnect(force=True)
-            return await channel.connect(
-                cls=wavelink.Player,
-                self_deaf=True,
-                timeout=self.voice_connect_timeout_seconds,
-            )
-        except Exception:
-            self._lavalink_voice_retry_after[guild.id] = (
-                time.monotonic() + self.lavalink_voice_timeout_cooldown_seconds
-            )
-            LOGGER.debug("Falha ao reconectar no Lavalink, mantendo FFmpeg", exc_info=True)
-            try:
-                return await channel.connect(self_deaf=True, timeout=self.voice_connect_timeout_seconds)
-            except Exception:
-                return guild.voice_client
+        return voice_client
 
     async def _force_voice_session_refresh(
         self,
@@ -530,10 +405,7 @@ class RuntimePlaybackMixin:
             LOGGER.debug("Falha ao desconectar sessao atual no refresh guild %s", guild.id, exc_info=True)
         await asyncio.sleep(0.2)
         try:
-            if self.lavalink_enabled and wavelink is not None:
-                refreshed = await channel.connect(cls=wavelink.Player, self_deaf=True)
-            else:
-                refreshed = await channel.connect(self_deaf=True)
+            refreshed = await channel.connect(self_deaf=True)
             await self._wait_voice_state_sync(guild, channel, timeout_seconds=2.0)
             return refreshed
         except Exception:
@@ -572,20 +444,12 @@ class RuntimePlaybackMixin:
             await self._start_next_if_needed(guild, text_channel)
             return True
 
-        # Se o Lavalink aceitou play mas ficou sem audio audivel, recria sessao de voz.
-        if self._is_lavalink_player(voice_client):
-            voice_client = await self._force_voice_session_refresh(guild, voice_client)
-
         for attempt, delay in enumerate(self.reconnect_policy.backoff_schedule(), start=1):
             try:
                 await asyncio.wait_for(self._start_next_if_needed(guild, text_channel), timeout=12.0)
                 voice_client = guild.voice_client
                 if self._is_voice_playing(voice_client) or self._is_voice_paused(voice_client):
                     self._set_player_state(guild.id, PlayerState.PLAYING, reason=f"recover_ok_attempt_{attempt}")
-                    return True
-                if voice_client is not None and not isinstance(voice_client, discord.VoiceClient):
-                    # Em testes/mocks sem API real de voice state, considera recover bem-sucedido.
-                    self._set_player_state(guild.id, PlayerState.PLAYING, reason=f"recover_mock_ok_attempt_{attempt}")
                     return True
             except Exception:
                 LOGGER.debug("recover attempt failed guild=%s attempt=%s", guild.id, attempt, exc_info=True)
@@ -601,10 +465,12 @@ class RuntimePlaybackMixin:
     ) -> None:
         voice_client = guild.voice_client
         if not self._is_voice_connected(voice_client):
+            self._cancel_playback_watchdog(guild.id)
             self._set_player_state(guild.id, PlayerState.IDLE, reason="voice_disconnected")
             await self._clear_voice_mini_panel(guild.id)
             return
         if not self._is_voice_session_usable(guild, voice_client):
+            self._cancel_playback_watchdog(guild.id)
             self._set_player_state(guild.id, PlayerState.RECOVERING, reason="voice_session_unusable")
             self._mark_voice_reconnect_required(guild.id)
             try:
@@ -623,88 +489,27 @@ class RuntimePlaybackMixin:
                 return
             if player.current is not None:
                 return
+            if player.restored_queue_pending_activation and text_channel is None:
+                self._set_player_state(guild.id, PlayerState.IDLE, reason="restored_queue_pending_activation")
+                return
+            if player.restored_queue_pending_activation:
+                player.restored_queue_pending_activation = False
             if player.queue.empty():
+                self._cancel_playback_watchdog(guild.id)
                 self._set_player_state(guild.id, PlayerState.IDLE, reason="queue_empty")
                 self._schedule_idle_disconnect(guild, text_channel)
                 return
 
             track = await player.queue.get()
             self._set_player_state(guild.id, PlayerState.BUFFERING, reason=f"buffering:{track.title[:48]}")
-            force_ffmpeg_for_track = self._consume_track_ffmpeg_fallback(guild.id, track)
             player.current = track
-            player.current_started_at = time.monotonic()
+            player.current_started_at = None
             player.pause_started_at = None
             player.paused_accumulated_seconds = 0.0
             self._cancel_idle_timer(guild.id)
             seek_seconds = player.pending_seek_seconds
             player.pending_seek_seconds = 0
             await self._persist_queue_state(guild.id, player)
-
-            if force_ffmpeg_for_track and self._is_lavalink_player(voice_client):
-                switched = await self._switch_voice_to_ffmpeg(guild, voice_client)
-                if switched is not None:
-                    voice_client = switched
-
-            if self._is_lavalink_player(voice_client) and wavelink is not None and not force_ffmpeg_for_track:
-                try:
-                    if not self._provider_available("lavalink_search"):
-                        raise RuntimeError("Lavalink search temporariamente indisponivel.")
-                    playable = self._consume_lavalink_playable_cache(track)
-                    if playable is None:
-                        identifier = self._lavalink_play_identifier(track)
-                        search_result = await wavelink.Playable.search(identifier)
-                        playable = search_result[0] if search_result else None
-                    if playable is None:
-                        raise RuntimeError("Lavalink nao encontrou faixa reproduzivel para o item.")
-                    # Sincroniza metadados reais retornados pelo Lavalink para evitar
-                    # painel "ao vivo/desconhecido" quando a faixa veio de fallback.
-                    resolved_title = str(getattr(playable, "title", "") or "").strip()
-                    if resolved_title:
-                        track.title = resolved_title
-                    resolved_author = str(getattr(playable, "author", "") or "").strip()
-                    if resolved_author:
-                        track.artist = resolved_author
-                    resolved_uri = str(getattr(playable, "uri", "") or "").strip()
-                    if resolved_uri:
-                        track.webpage_url = resolved_uri
-                        track.source_query = resolved_uri
-                    length_ms = int(getattr(playable, "length", 0) or 0)
-                    if length_ms > 0:
-                        track.duration_seconds = max(length_ms // 1000, 1)
-                    await voice_client.play(playable, volume=max(1, min(int(round(player.volume * 100)), 1000)))
-                    if seek_seconds > 0:
-                        await voice_client.seek(seek_seconds * 1000)
-                    self._provider_success("lavalink_search")
-                except Exception:
-                    self._set_player_state(guild.id, PlayerState.RECOVERING, reason="lavalink_track_error")
-                    player.current = None
-                    player.current_started_at = None
-                    player.pause_started_at = None
-                    player.paused_accumulated_seconds = 0.0
-                    try:
-                        player.queue.task_done()
-                    except ValueError:
-                        pass
-                    self._mark_track_ffmpeg_fallback(guild.id, track)
-                    self._provider_failure("lavalink_search")
-                    await self._persist_queue_state(guild.id, player)
-                    self._metrics["playback_failures"] += 1
-                    LOGGER.exception("Falha ao iniciar playback Lavalink no guild %s", guild.id)
-                    if text_channel:
-                        await self._send_channel(
-                            text_channel,
-                            self._warn("Lavalink falhou para esta faixa. Aplicando fallback FFmpeg somente neste item."),
-                        )
-                    self.queue_service.enqueue_front(player, track)
-                    await self._switch_voice_to_ffmpeg(guild, voice_client)
-                    await self._persist_queue_state(guild.id, player)
-                    await self._start_next_if_needed(guild, text_channel)
-                    return
-                self._schedule_prefetch_next(guild.id, player)
-                await self._upsert_nowplaying_message(guild, text_channel)
-                self._schedule_nowplaying_updater(guild)
-                self._set_player_state(guild.id, PlayerState.PLAYING, reason="lavalink_playing")
-                return
 
             try:
                 source = await self.music.build_audio_source(
@@ -719,6 +524,10 @@ class RuntimePlaybackMixin:
                 player.current_started_at = None
                 player.pause_started_at = None
                 player.paused_accumulated_seconds = 0.0
+                try:
+                    player.queue.task_done()
+                except ValueError:
+                    pass
                 await self._persist_queue_state(guild.id, player)
                 self._metrics["playback_failures"] += 1
                 LOGGER.exception("Falha ao preparar stream no guild %s", guild.id)
@@ -754,9 +563,11 @@ class RuntimePlaybackMixin:
                     await self._send_channel(text_channel, self._error(f"Nao consegui iniciar reproducao: `{exc}`"))
                 await self._start_next_if_needed(guild, text_channel)
                 return
+            player.current_started_at = time.monotonic()
             self._schedule_prefetch_next(guild.id, player)
             await self._upsert_nowplaying_message(guild, text_channel)
             self._schedule_nowplaying_updater(guild)
+            self._schedule_playback_watchdog(guild, text_channel)
             self._set_player_state(guild.id, PlayerState.PLAYING, reason="ffmpeg_playing")
 
             async def wait_and_advance() -> None:
@@ -787,6 +598,7 @@ class RuntimePlaybackMixin:
                         self._cancel_prefetch(guild.id)
                         await self._clear_votes_for_guild(guild.id)
                         await self._clear_voice_mini_panel(guild.id)
+                        self._cancel_playback_watchdog(guild.id)
                         self.music.remove_player(guild.id)
                         self._loaded_settings.discard(guild.id)
                         self._cancel_idle_timer(guild.id)
@@ -802,30 +614,8 @@ class RuntimePlaybackMixin:
                             player.paused_accumulated_seconds = 0.0
                             await self._persist_queue_state(guild.id, player)
                             self._set_player_state(guild.id, PlayerState.RECOVERING, reason="health_stuck_recovery")
+                            self._mark_voice_reconnect_required(guild.id)
                             await self._start_next_if_needed(guild)
-
-                lavalink_connected = False
-                if self.lavalink_enabled and wavelink is not None:
-                    pool = getattr(wavelink, "Pool", None)
-                    nodes = getattr(pool, "nodes", {}) if pool is not None else {}
-                    if isinstance(nodes, dict) and len(nodes) > 0:
-                        lavalink_connected = True
-                if self._last_lavalink_connected is None:
-                    self._last_lavalink_connected = lavalink_connected
-                elif self._last_lavalink_connected != lavalink_connected:
-                    self._last_lavalink_connected = lavalink_connected
-                    if lavalink_connected:
-                        await self._send_health_alert(
-                            "lavalink_recovered",
-                            "Lavalink Recuperado",
-                            "Conexao com o Lavalink foi restabelecida.",
-                        )
-                    else:
-                        await self._send_health_alert(
-                            "lavalink_down",
-                            "Lavalink Indisponivel",
-                            "Nao ha nodes conectados no pool. Bot segue em fallback FFmpeg.",
-                        )
 
                 self._health_ticks += 1
                 if self._health_ticks % 4 == 0:
@@ -844,7 +634,7 @@ class RuntimePlaybackMixin:
                             "Latencia Elevada",
                             (
                                 f"Latencia media dos comandos: `{snapshot.average_latency_ms:.1f} ms`.\n"
-                                "Recomendo verificar rede, Lavalink e carga local."
+                                "Recomendo verificar rede, extracao de audio e carga local."
                             ),
                         )
                     LOGGER.info(

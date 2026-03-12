@@ -45,24 +45,6 @@ class PlayCommandsMixin:
             return False
         return host.endswith("spotify.com") or host == "music.apple.com" or host.endswith(".music.apple.com")
 
-    @staticmethod
-    def _looks_like_direct_url(value: str) -> bool:
-        raw = value.strip()
-        return "://" in raw and not raw.startswith("search:")
-
-    def _can_use_lavalink_fastpath(self, query: str, *, to_front: bool) -> bool:
-        if to_front:
-            return False
-        if not self.lavalink_enabled:
-            return False
-        if self._looks_like_playlist_query(query):
-            return False
-        if not self._looks_like_direct_url(query):
-            return False
-        if self._is_spotify_or_apple_url(query):
-            return False
-        return True
-
     def _search_result_line(self, idx: int, track: Track) -> str:
         artist = (track.artist or "").strip() or self._guess_artist(track.title) or "desconhecido"
         return (
@@ -209,64 +191,37 @@ class PlayCommandsMixin:
             return
 
         lazy_extract_limit: int | None = None
-        can_lazy_extract = self.playlist_incremental_enabled and not to_front and self._looks_like_playlist_query(link_ou_busca)
+        is_spotify_collection = "spotify.com/playlist/" in link_ou_busca.casefold() or "spotify.com/album/" in link_ou_busca.casefold()
+        can_lazy_extract = self.playlist_incremental_enabled and not to_front and self._looks_like_playlist_query(link_ou_busca) and not is_spotify_collection
         if can_lazy_extract:
-            lazy_extract_limit = min(max(self.playlist_initial_enqueue, 1), self.max_playlist_import)
+            # Bootstrap with a single playable track so /play can start immediately.
+            lazy_extract_limit = 1
         resolved_spotify = False
-        if self._can_use_lavalink_fastpath(link_ou_busca, to_front=to_front):
-            normalized_link = link_ou_busca.strip()
-            batch = TrackBatch(
-                tracks=[
-                    Track(
-                        source_query=normalized_link,
-                        title=normalized_link,
-                        webpage_url=normalized_link,
-                        requested_by=requester_name,
-                        duration_seconds=None,
-                    )
-                ],
-                total_items=1,
-                invalid_items=0,
+        try:
+            batch, resolved_spotify = await self._extract_batch_with_spotify_fallback(
+                link=link_ou_busca,
+                requester=requester_name,
+                max_items=lazy_extract_limit,
             )
             if progress_handle is not None:
                 await self.command_service.update_progress(
                     progress_handle,
                     title="🎧 Preparando /play",
                     description=(
-                        "Etapa: `extracao` (fast-path Lavalink)\n"
-                        "URL direta detectada, pulando extrator pesado.\n"
+                        "Etapa: `extracao`\n"
+                        f"Itens detectados: `{batch.total_items}` (invalidas: `{batch.invalid_items}`)\n"
                         f"{self._separator()}\nConectando no canal de voz..."
                     ),
                     color=self._theme_color("general"),
                     embed_factory=self._embed,
                     edit_original=self._edit_original_response,
                 )
-        else:
-            try:
-                batch, resolved_spotify = await self._extract_batch_with_spotify_fallback(
-                    link=link_ou_busca,
-                    requester=requester_name,
-                    max_items=lazy_extract_limit,
-                )
-                if progress_handle is not None:
-                    await self.command_service.update_progress(
-                        progress_handle,
-                        title="🎧 Preparando /play",
-                        description=(
-                            "Etapa: `extracao`\n"
-                            f"Itens detectados: `{batch.total_items}` (invalidas: `{batch.invalid_items}`)\n"
-                            f"{self._separator()}\nConectando no canal de voz..."
-                        ),
-                        color=self._theme_color("general"),
-                        embed_factory=self._embed,
-                        edit_original=self._edit_original_response,
-                    )
-            except Exception as exc:
-                voice_task.cancel()
-                self._metrics["extraction_failures"] += 1
-                title, description = self._friendly_extraction_error(exc)
-                await self._send_followup(interaction, embed=self._error_embed(title, description))
-                return
+        except Exception as exc:
+            voice_task.cancel()
+            self._metrics["extraction_failures"] += 1
+            title, description = self._friendly_extraction_error(exc)
+            await self._send_followup(interaction, embed=self._error_embed(title, description))
+            return
         self._record_command_stage_latency("play", "extract", (time.monotonic() - t_extract_started) * 1000.0)
 
         try:
@@ -291,8 +246,6 @@ class PlayCommandsMixin:
         selected_tracks: list[Track] = []
         skipped_by_policy = 0
         selection_limit = capacity
-        if self.playlist_incremental_enabled and not to_front and batch.total_items > 1:
-            selection_limit = max(min(capacity, max(self.playlist_initial_enqueue, 1)), 1)
         for track in candidate_tracks:
             if len(selected_tracks) >= selection_limit:
                 break
@@ -302,6 +255,7 @@ class PlayCommandsMixin:
                 continue
             selected_tracks.append(track)
         skipped_by_import = max(len(batch.tracks) - playlist_window, 0)
+        deferred_by_incremental = 0
         skipped_by_queue = max(len(candidate_tracks) - len(selected_tracks) - skipped_by_policy, 0)
         if not selected_tracks:
             embed = self._warn_embed(
@@ -334,6 +288,7 @@ class PlayCommandsMixin:
         t_queue_apply_started = time.monotonic()
         lock = self._get_lock(guild.id)
         async with lock:
+            await self._drop_restored_queue_if_idle(guild.id, player, reason=f"{action_label}_command")
             available_capacity = max(self.max_queue_size - len(player.snapshot_queue()), 0)
             if available_capacity <= 0:
                 await self._send_followup(
@@ -378,6 +333,8 @@ class PlayCommandsMixin:
             skipped_by_queue = max(len(candidate_tracks) - len(selected_tracks) - skipped_by_policy, 0)
 
             if plan.incremental:
+                deferred_by_incremental = max(len(candidate_tracks) - len(selected_tracks) - skipped_by_policy, 0)
+                skipped_by_queue = 0
                 initial_tracks = list(plan.immediate)
                 remaining_tracks = candidate_tracks
                 for track in initial_tracks:
@@ -494,6 +451,7 @@ class PlayCommandsMixin:
                 name="Detalhes",
                 value=(
                     f"Limite de import: `{skipped_by_import}`\n"
+                    f"Em background: `{deferred_by_incremental}`\n"
                     f"Fila cheia: `{skipped_by_queue}`\n"
                     f"Moderacao: `{skipped_by_policy}`\n"
                     f"Invalidas: `{batch.invalid_items}`"

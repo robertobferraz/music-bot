@@ -277,14 +277,15 @@ class PlayCommandsMixin:
             await self._send_followup(interaction, embed=embed)
             return
 
+        lazy_playlist_pending = can_lazy_extract and batch.total_items > len(selected_tracks)
         plan = self.scheduler.plan_playlist_enqueue(
             tracks=selected_tracks,
             to_front=to_front,
             priority=QueuePriority.HIGH if to_front else QueuePriority.NORMAL,
-            incremental_enabled=self.playlist_incremental_enabled and batch.total_items > 1,
+            incremental_enabled=self.playlist_incremental_enabled and batch.total_items > 1 and not lazy_playlist_pending,
             initial_enqueue=max(self.playlist_initial_enqueue, 1),
         )
-        incremental_mode = plan.incremental
+        incremental_mode = plan.incremental or lazy_playlist_pending
         t_queue_apply_started = time.monotonic()
         lock = self._get_lock(guild.id)
         async with lock:
@@ -327,12 +328,37 @@ class PlayCommandsMixin:
                     tracks=selected_tracks,
                     to_front=to_front,
                     priority=QueuePriority.HIGH if to_front else QueuePriority.NORMAL,
-                    incremental_enabled=self.playlist_incremental_enabled and batch.total_items > 1,
+                    incremental_enabled=self.playlist_incremental_enabled and batch.total_items > 1 and not lazy_playlist_pending,
                     initial_enqueue=max(self.playlist_initial_enqueue, 1),
                 )
             skipped_by_queue = max(len(candidate_tracks) - len(selected_tracks) - skipped_by_policy, 0)
 
-            if plan.incremental:
+            if lazy_playlist_pending:
+                deferred_by_incremental = max(batch.total_items - len(selected_tracks), 0)
+                skipped_by_queue = 0
+                initial_tracks = list(selected_tracks)
+                for track in initial_tracks:
+                    await self.queue_service.enqueue(player, track)
+                job_id = None
+                if self.feature_flags.playlist_jobs_enabled:
+                    job = self.playlist_jobs.create(
+                        guild.id,
+                        link_ou_busca,
+                        requester_name,
+                        total=max(batch.total_items - len(initial_tracks), 0),
+                    )
+                    job_id = job.job_id
+                self._schedule_lazy_playlist_resolve(
+                    guild=guild,
+                    query=link_ou_busca,
+                    requester=requester_name,
+                    initial_tracks=initial_tracks,
+                    text_channel=interaction.channel,
+                    job_id=job_id,
+                )
+                queued_now = len(initial_tracks)
+                queued_later = max(batch.total_items - len(initial_tracks), 0)
+            elif plan.incremental:
                 deferred_by_incremental = max(len(candidate_tracks) - len(selected_tracks) - skipped_by_policy, 0)
                 skipped_by_queue = 0
                 initial_tracks = list(plan.immediate)

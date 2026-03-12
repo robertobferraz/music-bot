@@ -46,6 +46,9 @@ class MusicResolver:
         self._spotify_access_token: str = ""
         self._spotify_access_token_expires_at: float = 0.0
         self._spotify_user_access_token_expires_at: float = 0.0
+        self._spotify_frontend_fallback_enabled = os.getenv("SPOTIFY_FRONTEND_FALLBACK", "false").strip().casefold() in {"1", "true", "yes", "on"}
+        self._spotify_frontend_provider_url = os.getenv("SPOTIFY_FRONTEND_PROVIDER_URL", "").strip()
+        self._spotify_frontend_provider_token = os.getenv("SPOTIFY_FRONTEND_PROVIDER_TOKEN", "").strip()
         self._spotify_resolve_cache_ttl_seconds = max(
             int(os.getenv("SPOTIFY_RESOLVE_CACHE_TTL_SECONDS", "604800").strip() or "604800"),
             60,
@@ -60,7 +63,7 @@ class MusicResolver:
         )
         self._spotify_track_details_forbidden_logged = False
         LOGGER.info(
-            "spotify_api_enabled=%s spotify_user_token=%s spotify_user_refresh=%s market=%s strict_match=%s candidate_limit=%s resolve_cache_ttl=%s failure_cache_ttl=%s resolve_concurrency=%s",
+            "spotify_api_enabled=%s spotify_user_token=%s spotify_user_refresh=%s market=%s strict_match=%s candidate_limit=%s resolve_cache_ttl=%s failure_cache_ttl=%s resolve_concurrency=%s spotify_frontend_fallback=%s spotify_frontend_provider=%s",
             bool(
                 self._spotify_user_access_token
                 or self._spotify_user_refresh_token
@@ -74,6 +77,8 @@ class MusicResolver:
             self._spotify_resolve_cache_ttl_seconds,
             self._spotify_resolve_failure_cache_ttl_seconds,
             self._spotify_resolve_concurrency,
+            self._spotify_frontend_fallback_enabled,
+            bool(self._spotify_frontend_provider_url),
         )
 
     async def close(self) -> None:
@@ -105,9 +110,23 @@ class MusicResolver:
         if not self._is_spotify_url(link):
             return await self.extract_tracks(link, requester=requester, max_items=max_items), False
 
-        api_batch = await self._spotify_batch_via_api(link, requester=requester, max_items=max_items)
+        resolved_via_frontend = False
+        try:
+            api_batch = await self._spotify_batch_via_api(link, requester=requester, max_items=max_items)
+        except RuntimeError as exc:
+            lowered = str(exc).casefold()
+            if self._is_spotify_collection_url(link) and ("spotify playlist nao acessivel pela api" in lowered or "spotify album nao acessivel pela api" in lowered):
+                api_batch = await self._spotify_batch_via_frontend_provider(link, requester=requester, max_items=max_items)
+                resolved_via_frontend = api_batch is not None
+                if api_batch is None:
+                    raise
+            else:
+                raise
         if api_batch is not None:
-            LOGGER.info("Spotify batch resolvido via API url=%s total_items=%s", link, api_batch.total_items)
+            if resolved_via_frontend:
+                LOGGER.info("Spotify batch resolvido via provider externo url=%s total_items=%s", link, api_batch.total_items)
+            else:
+                LOGGER.info("Spotify batch resolvido via API url=%s total_items=%s", link, api_batch.total_items)
             return api_batch, True
 
         if self._is_spotify_collection_url(link):
@@ -413,6 +432,86 @@ class MusicResolver:
             or self._spotify_user_refresh_token
             or (self._spotify_client_id and self._spotify_client_secret)
         )
+
+    def _spotify_frontend_provider_enabled(self) -> bool:
+        return self._spotify_frontend_fallback_enabled and bool(self._spotify_frontend_provider_url)
+
+    async def _spotify_batch_via_frontend_provider(
+        self,
+        spotify_url: str,
+        *,
+        requester: str,
+        max_items: int | None,
+    ) -> TrackBatch | None:
+        if not self._spotify_frontend_provider_enabled():
+            return None
+        kind, _spotify_id = self._spotify_kind_and_id_from_url(spotify_url)
+        if kind not in {"playlist", "album"}:
+            return None
+        session = await self._ensure_http_session()
+        params = {"url": spotify_url, "kind": kind}
+        if max_items is not None and max_items > 0:
+            params["limit"] = str(max_items)
+        headers: dict[str, str] = {}
+        if self._spotify_frontend_provider_token:
+            headers["Authorization"] = f"Bearer {self._spotify_frontend_provider_token}"
+        try:
+            async with session.get(self._spotify_frontend_provider_url, params=params, headers=headers) as resp:
+                if resp.status != 200:
+                    LOGGER.warning("Spotify frontend provider falhou status=%s kind=%s", resp.status, kind)
+                    return None
+                payload = await resp.json()
+        except (ClientError, ValueError):
+            LOGGER.info("Spotify frontend provider falhou kind=%s", kind, exc_info=True)
+            return None
+        if not isinstance(payload, dict):
+            return None
+        items = payload.get("items")
+        if not isinstance(items, list) or not items:
+            return None
+        limit = max_items if max_items is not None and max_items > 0 else len(items)
+        tracks: list[Track] = []
+        invalid = int(payload.get("invalid_items") or 0)
+        for raw in items:
+            if not isinstance(raw, dict):
+                invalid += 1
+                continue
+            title = str(raw.get("title") or raw.get("name") or "").strip()
+            artist = str(raw.get("artist") or "").strip()
+            if not artist and isinstance(raw.get("artists"), list):
+                artist = ", ".join(str(item).strip() for item in raw.get("artists") if str(item).strip())
+            if not title:
+                invalid += 1
+                continue
+            item_link = str(raw.get("spotify_url") or raw.get("webpage_url") or spotify_url).strip() or spotify_url
+            duration_seconds = raw.get("duration_seconds")
+            if duration_seconds is None:
+                duration_ms = raw.get("duration_ms")
+                if duration_ms not in (None, ""):
+                    try:
+                        duration_seconds = max(1, int(duration_ms) // 1000)
+                    except (TypeError, ValueError):
+                        duration_seconds = None
+            else:
+                try:
+                    duration_seconds = int(duration_seconds)
+                except (TypeError, ValueError):
+                    duration_seconds = None
+            track = self._spotify_fallback_track((title, artist), item_link, requester=requester)
+            track.duration_seconds = duration_seconds
+            track.artist = artist or None
+            isrc = str(raw.get("isrc") or "").strip() or None
+            track.isrc = isrc
+            tracks.append(track)
+            if len(tracks) >= limit:
+                break
+        if not tracks:
+            return None
+        total_items = int(payload.get("total") or 0)
+        if total_items <= 0:
+            total_items = len(tracks) + invalid
+        LOGGER.info("Spotify frontend provider resolveu url=%s total_items=%s invalid_items=%s", spotify_url, total_items, invalid)
+        return TrackBatch(tracks=tracks, total_items=max(total_items, len(tracks) + invalid), invalid_items=invalid)
 
     async def _ensure_http_session(self) -> ClientSession:
         session = self._http_session

@@ -63,6 +63,35 @@ POSTGRES_DSN=postgresql://usuario:senha@host:5432/botmusica
 
 Observação: o arquivo [.env.example](./.env.example) tem opções detalhadas de tuning.
 
+## Spotify playlists com provider externo
+O caminho oficial do bot para Spotify usa a Web API pública. Quando uma playlist/álbum retorna `403` em `/items`, o bot pode usar um provider externo "frontend-like" por HTTP.
+
+Esse provider:
+- deve ficar em **repo separado** do `music-bot`
+- roda como serviço HTTP independente
+- devolve um JSON normalizado com `items`, `total` e `invalid_items`
+
+No bot, ficam apenas as variáveis de cliente HTTP:
+
+```env
+SPOTIFY_FRONTEND_FALLBACK=true
+SPOTIFY_FRONTEND_PROVIDER_URL=http://bm-provider:8081/resolve
+SPOTIFY_FRONTEND_PROVIDER_TOKEN=
+```
+
+Se o provider exigir autenticação Bearer, configure o mesmo segredo nos dois lados:
+
+```env
+SPOTIFY_FRONTEND_PROVIDER_TOKEN=segredo-do-bot
+SPOTIFY_FRONTEND_PROVIDER_AUTH_TOKEN=segredo-do-provider
+```
+
+Observação:
+- `SPOTIFY_FRONTEND_PROVIDER_AUTH_TOKEN` pertence ao **provider externo**
+- `SPOTIFY_FRONTEND_PROVIDER_TOKEN` pertence ao **bot**
+- em ambiente local, ambos podem ficar vazios para teste
+- provider sugerido em repo separado: [bm-provider](https://github.com/robertobferraz/bm-provider)
+
 ## Comandos principais
 - `/play`, `/playnext`, `/search`
 - `/pause`, `/resume`, `/skip`, `/stop`
@@ -177,6 +206,7 @@ kubectl -n botmusica port-forward svc/botmusica-web 8080:8080
 - `OpusNotLoaded`: instalar `opus` no host e/ou configurar `OPUS_LIBRARY`
 - `Backend postgres requer psycopg[binary]`: `pip install -e .[postgres]`
 - Falha de busca YouTube: revisar `YTDLP_JS_RUNTIME` e `YTDLP_REMOTE_COMPONENTS`
+- Playlist Spotify com `403` na API oficial: validar o provider externo separadamente com `curl /resolve` antes de testar `/play`
 
 ## Notas para publicar no GitHub
 - Não versionar `.env`, `data/`, `*.db`, `__pycache__`, `*.pyc`

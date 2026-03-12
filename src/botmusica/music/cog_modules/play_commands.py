@@ -45,74 +45,6 @@ class PlayCommandsMixin:
             return False
         return host.endswith("spotify.com") or host == "music.apple.com" or host.endswith(".music.apple.com")
 
-    @staticmethod
-    def _is_spotify_collection_url(value: str) -> bool:
-        raw = value.strip()
-        if "://" not in raw:
-            return False
-        try:
-            parsed = urlparse(raw)
-        except ValueError:
-            return False
-        host = (parsed.hostname or "").casefold()
-        if host != "open.spotify.com" and not host.endswith(".spotify.com"):
-            return False
-        parts = [part for part in parsed.path.split("/") if part]
-        if not parts:
-            return False
-        if parts[0].startswith("intl-") and len(parts) >= 2:
-            kind = parts[1].casefold()
-        else:
-            kind = parts[0].casefold()
-        return kind in {"playlist", "album"}
-
-    @staticmethod
-    def _looks_like_direct_url(value: str) -> bool:
-        raw = value.strip()
-        return "://" in raw and not raw.startswith("search:")
-
-    def _can_use_lavalink_fastpath(self, query: str, *, to_front: bool) -> bool:
-        if to_front:
-            return False
-        if not self.lavalink_enabled:
-            return False
-        if self._looks_like_playlist_query(query):
-            return False
-        if not self._looks_like_direct_url(query):
-            return False
-        if self._is_spotify_or_apple_url(query):
-            return False
-        return True
-
-    @staticmethod
-    def _is_streaming_catalog_url(value: str) -> bool:
-        raw = value.strip()
-        if "://" not in raw:
-            return False
-        try:
-            host = (urlparse(raw).hostname or "").casefold()
-        except ValueError:
-            return False
-        if not host:
-            return False
-        return (
-            host.endswith("spotify.com")
-            or host == "music.apple.com"
-            or host.endswith(".music.apple.com")
-            or host.endswith("deezer.com")
-        )
-
-    @staticmethod
-    def _is_deezer_url(value: str) -> bool:
-        raw = value.strip()
-        if "://" not in raw:
-            return False
-        try:
-            host = (urlparse(raw).hostname or "").casefold()
-        except ValueError:
-            return False
-        return bool(host) and host.endswith("deezer.com")
-
     def _search_result_line(self, idx: int, track: Track) -> str:
         artist = (track.artist or "").strip() or self._guess_artist(track.title) or "desconhecido"
         return (
@@ -259,101 +191,37 @@ class PlayCommandsMixin:
             return
 
         lazy_extract_limit: int | None = None
-        can_lazy_extract = self.playlist_incremental_enabled and not to_front and self._looks_like_playlist_query(link_ou_busca)
+        is_spotify_collection = "spotify.com/playlist/" in link_ou_busca.casefold() or "spotify.com/album/" in link_ou_busca.casefold()
+        can_lazy_extract = self.playlist_incremental_enabled and not to_front and self._looks_like_playlist_query(link_ou_busca) and not is_spotify_collection
         if can_lazy_extract:
-            lazy_extract_limit = min(max(self.playlist_initial_enqueue, 1), self.max_playlist_import)
+            # Bootstrap with a single playable track so /play can start immediately.
+            lazy_extract_limit = 1
         resolved_spotify = False
-        prefer_lavalink_catalog = (
-            self.lavalink_enabled
-            and self._looks_like_direct_url(link_ou_busca)
-            and self._is_streaming_catalog_url(link_ou_busca)
-            and not self._is_spotify_or_apple_url(link_ou_busca)
-            and not self._is_deezer_url(link_ou_busca)
-            and not self._is_spotify_collection_url(link_ou_busca)
-        )
-        if prefer_lavalink_catalog:
-            lavalink_limit = max(min(self.max_playlist_import, lazy_extract_limit or self.max_playlist_import), 1)
-            lavalink_tracks = await self._search_tracks_lavalink(
-                link_ou_busca.strip(),
+        try:
+            batch, resolved_spotify = await self._extract_batch_with_spotify_fallback(
+                link=link_ou_busca,
                 requester=requester_name,
-                limit=lavalink_limit,
-            )
-            if lavalink_tracks:
-                batch = TrackBatch(
-                    tracks=lavalink_tracks,
-                    total_items=len(lavalink_tracks),
-                    invalid_items=0,
-                )
-                lowered_link = link_ou_busca.casefold()
-                resolved_spotify = "spotify.com" in lowered_link
-            else:
-                batch, resolved_spotify = await self._extract_batch_with_spotify_fallback(
-                    link=link_ou_busca,
-                    requester=requester_name,
-                    max_items=lazy_extract_limit,
-                )
-        elif self._can_use_lavalink_fastpath(link_ou_busca, to_front=to_front):
-            normalized_link = link_ou_busca.strip()
-            resolved_fastpath = await self._search_tracks_lavalink(
-                normalized_link,
-                requester=requester_name,
-                limit=1,
-            )
-            fastpath_track = resolved_fastpath[0] if resolved_fastpath else None
-            batch = TrackBatch(
-                tracks=[
-                    fastpath_track
-                    if fastpath_track is not None
-                    else Track(
-                        source_query=normalized_link,
-                        title=normalized_link,
-                        webpage_url=normalized_link,
-                        requested_by=requester_name,
-                        duration_seconds=None,
-                    )
-                ],
-                total_items=1,
-                invalid_items=0,
+                max_items=lazy_extract_limit,
             )
             if progress_handle is not None:
                 await self.command_service.update_progress(
                     progress_handle,
                     title="🎧 Preparando /play",
                     description=(
-                        "Etapa: `extracao` (fast-path Lavalink)\n"
-                        "URL direta detectada, pulando extrator pesado.\n"
+                        "Etapa: `extracao`\n"
+                        f"Itens detectados: `{batch.total_items}` (invalidas: `{batch.invalid_items}`)\n"
                         f"{self._separator()}\nConectando no canal de voz..."
                     ),
                     color=self._theme_color("general"),
                     embed_factory=self._embed,
                     edit_original=self._edit_original_response,
                 )
-        else:
-            try:
-                batch, resolved_spotify = await self._extract_batch_with_spotify_fallback(
-                    link=link_ou_busca,
-                    requester=requester_name,
-                    max_items=lazy_extract_limit,
-                )
-                if progress_handle is not None:
-                    await self.command_service.update_progress(
-                        progress_handle,
-                        title="🎧 Preparando /play",
-                        description=(
-                            "Etapa: `extracao`\n"
-                            f"Itens detectados: `{batch.total_items}` (invalidas: `{batch.invalid_items}`)\n"
-                            f"{self._separator()}\nConectando no canal de voz..."
-                        ),
-                        color=self._theme_color("general"),
-                        embed_factory=self._embed,
-                        edit_original=self._edit_original_response,
-                    )
-            except Exception as exc:
-                voice_task.cancel()
-                self._metrics["extraction_failures"] += 1
-                title, description = self._friendly_extraction_error(exc)
-                await self._send_followup(interaction, embed=self._error_embed(title, description))
-                return
+        except Exception as exc:
+            voice_task.cancel()
+            self._metrics["extraction_failures"] += 1
+            title, description = self._friendly_extraction_error(exc)
+            await self._send_followup(interaction, embed=self._error_embed(title, description))
+            return
         self._record_command_stage_latency("play", "extract", (time.monotonic() - t_extract_started) * 1000.0)
 
         try:
@@ -378,8 +246,6 @@ class PlayCommandsMixin:
         selected_tracks: list[Track] = []
         skipped_by_policy = 0
         selection_limit = capacity
-        if self.playlist_incremental_enabled and not to_front and batch.total_items > 1:
-            selection_limit = max(min(capacity, max(self.playlist_initial_enqueue, 1)), 1)
         for track in candidate_tracks:
             if len(selected_tracks) >= selection_limit:
                 break
@@ -389,6 +255,7 @@ class PlayCommandsMixin:
                 continue
             selected_tracks.append(track)
         skipped_by_import = max(len(batch.tracks) - playlist_window, 0)
+        deferred_by_incremental = 0
         skipped_by_queue = max(len(candidate_tracks) - len(selected_tracks) - skipped_by_policy, 0)
         if not selected_tracks:
             embed = self._warn_embed(
@@ -421,6 +288,7 @@ class PlayCommandsMixin:
         t_queue_apply_started = time.monotonic()
         lock = self._get_lock(guild.id)
         async with lock:
+            await self._drop_restored_queue_if_idle(guild.id, player, reason=f"{action_label}_command")
             available_capacity = max(self.max_queue_size - len(player.snapshot_queue()), 0)
             if available_capacity <= 0:
                 await self._send_followup(
@@ -465,17 +333,15 @@ class PlayCommandsMixin:
             skipped_by_queue = max(len(candidate_tracks) - len(selected_tracks) - skipped_by_policy, 0)
 
             if plan.incremental:
+                deferred_by_incremental = max(len(candidate_tracks) - len(selected_tracks) - skipped_by_policy, 0)
+                skipped_by_queue = 0
                 initial_tracks = list(plan.immediate)
                 remaining_tracks = candidate_tracks
                 for track in initial_tracks:
                     await self.queue_service.enqueue(player, track)
                 initial_keys = {self._track_key(track) for track in initial_tracks}
                 remaining_tracks = [track for track in remaining_tracks if self._track_key(track) not in initial_keys]
-                full_playlist_pending = self._playlist_has_pending_items(
-                    query=link_ou_busca,
-                    batch=batch,
-                    extraction_limit=lazy_extract_limit,
-                )
+                full_playlist_pending = batch.total_items > len(batch.tracks)
                 if full_playlist_pending:
                     job_id = None
                     if self.feature_flags.playlist_jobs_enabled:
@@ -544,7 +410,6 @@ class PlayCommandsMixin:
         self._record_query(guild.id, link_ou_busca)
         if queued_now == 1 and queued_later == 0 and batch.total_items == 1 and batch.invalid_items == 0:
             only_track = selected_tracks[0]
-            artist = (only_track.artist or "").strip() or self._guess_artist(only_track.title) or "desconhecido"
             embed = self._ok_embed(
                 (
                     "Musica adicionada (via Spotify)"
@@ -557,7 +422,7 @@ class PlayCommandsMixin:
                 ),
                 (
                     f"**{only_track.title}**\n"
-                    f"`{self._format_duration(only_track.duration_seconds)}` • artista: `{artist}` • pedido por `{only_track.requested_by}`"
+                    f"`{self._format_duration(only_track.duration_seconds)}` • pedido por `{only_track.requested_by}`"
                 ),
             )
         else:
@@ -586,6 +451,7 @@ class PlayCommandsMixin:
                 name="Detalhes",
                 value=(
                     f"Limite de import: `{skipped_by_import}`\n"
+                    f"Em background: `{deferred_by_incremental}`\n"
                     f"Fila cheia: `{skipped_by_queue}`\n"
                     f"Moderacao: `{skipped_by_policy}`\n"
                     f"Invalidas: `{batch.invalid_items}`"
@@ -739,11 +605,6 @@ class PlayCommandsMixin:
             results, stale = self._cache_get_search(guild_cache_key, allow_stale=True)
             cache_scope = "guild"
         if results is not None:
-            display_query = consulta
-            if self._looks_like_direct_url(consulta) and results:
-                lead = results[0]
-                lead_artist = (lead.artist or "").strip() or self._guess_artist(lead.title) or "desconhecido"
-                display_query = f"{lead.title} - {lead_artist}"
             if stale:
                 self._schedule_search_refresh(user_cache_key, consulta, requester, effective_limit)
                 self._schedule_search_refresh(guild_cache_key, consulta, "guild-cache", effective_limit)
@@ -753,7 +614,7 @@ class PlayCommandsMixin:
             )
             embed = self._embed(
                 "🔎 Resultados da Busca",
-                f"Consulta: **{display_query}**\n{self._separator()}\n{description}",
+                f"Consulta: **{consulta}**\n{self._separator()}\n{description}",
                 color=self._theme_color("general"),
             )
             footer = "Resultados em cache"
@@ -791,19 +652,13 @@ class PlayCommandsMixin:
                 await self._send_followup(interaction, embed=embed, ephemeral=True)
             return
 
-        display_query = consulta
-        if self._looks_like_direct_url(consulta) and results:
-            lead = results[0]
-            lead_artist = (lead.artist or "").strip() or self._guess_artist(lead.title) or "desconhecido"
-            display_query = f"{lead.title} - {lead_artist}"
-
         description = "\n".join(
             self._search_result_line(idx + 1, track)
             for idx, track in enumerate(results)
         )
         embed = self._embed(
             "🔎 Resultados da Busca",
-            f"Consulta: **{display_query}**\n{self._separator()}\n{description}",
+            f"Consulta: **{consulta}**\n{self._separator()}\n{description}",
             color=self._theme_color("general"),
         )
         embed.set_footer(text="Selecione no menu abaixo para adicionar na fila.")

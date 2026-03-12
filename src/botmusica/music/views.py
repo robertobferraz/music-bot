@@ -462,7 +462,8 @@ class ControlRoomPlayModal(discord.ui.Modal, title="Adicionar musica"):
         query = str(self.link_ou_busca.value).strip()
         requester = interaction.user.display_name if interaction.user else "desconhecido"
         lazy_extract_limit: int | None = None
-        can_lazy_extract = self.cog.playlist_incremental_enabled and self.cog._looks_like_playlist_query(query)
+        is_spotify_collection = "spotify.com/playlist/" in query.casefold() or "spotify.com/album/" in query.casefold()
+        can_lazy_extract = self.cog.playlist_incremental_enabled and self.cog._looks_like_playlist_query(query) and not is_spotify_collection
         if can_lazy_extract:
             lazy_extract_limit = min(max(self.cog.playlist_initial_enqueue, 1), self.cog.max_playlist_import)
         try:
@@ -482,8 +483,6 @@ class ControlRoomPlayModal(discord.ui.Modal, title="Adicionar musica"):
         selected_tracks: list[Track] = []
         skipped_by_policy = 0
         selection_limit = capacity
-        if self.cog.playlist_incremental_enabled and batch.total_items > 1:
-            selection_limit = max(min(capacity, max(self.cog.playlist_initial_enqueue, 1)), 1)
         for track in candidate_tracks:
             if len(selected_tracks) >= selection_limit:
                 break
@@ -515,6 +514,7 @@ class ControlRoomPlayModal(discord.ui.Modal, title="Adicionar musica"):
 
         lock = self.cog._get_lock(guild.id)
         async with lock:
+            await self.cog._drop_restored_queue_if_idle(guild.id, player, reason="control_room_play")
             if not self.cog._has_queue_capacity(player):
                 await self.cog._send_followup(
                     interaction,
@@ -541,11 +541,7 @@ class ControlRoomPlayModal(discord.ui.Modal, title="Adicionar musica"):
                 initial_enqueue=max(self.cog.playlist_initial_enqueue, 1),
             )
 
-            full_playlist_pending = self.cog._playlist_has_pending_items(
-                query=query,
-                batch=batch,
-                extraction_limit=lazy_extract_limit,
-            )
+            full_playlist_pending = batch.total_items > len(batch.tracks)
             if plan.incremental:
                 initial_tracks = list(plan.immediate)
                 remaining_tracks = candidate_tracks

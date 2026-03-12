@@ -345,17 +345,13 @@ class DiscoveryCacheMixin:
         self._startup_warmup_done = True
         if self._startup_warmup_task and not self._startup_warmup_task.done():
             return
+        if self.search_startup_warmup_queries <= 0:
+            return
 
         async def worker() -> None:
             await asyncio.sleep(2.0)
             guilds = list(getattr(self.bot, "guilds", []))
             for guild in guilds:
-                # Warm de estado do player/fila para reduzir custo no primeiro comando do guild.
-                try:
-                    player = await self._get_player(int(guild.id))
-                    self._schedule_prefetch_next(int(guild.id), player)
-                except Exception:
-                    LOGGER.debug("Warmup: falha ao aquecer player do guild %s", getattr(guild, "id", "?"), exc_info=True)
                 try:
                     queries = await self.store.list_popular_queries(
                         int(guild.id),
@@ -544,14 +540,11 @@ class DiscoveryCacheMixin:
         self.nowplaying.cancel_updater(guild_id)
 
     async def _restore_nowplaying_message_if_needed(self, guild_id: int) -> None:
-        try:
-            await self.nowplaying.restore_message_if_needed(
-                guild_id=guild_id,
-                bot=self.bot,
-                store=self.store,
-            )
-        except Exception:
-            LOGGER.debug("Falha ao restaurar nowplaying para guild %s", guild_id, exc_info=True)
+        await self.nowplaying.restore_message_if_needed(
+            guild_id=guild_id,
+            bot=self.bot,
+            store=self.store,
+        )
 
     async def _upsert_nowplaying_message(
         self,

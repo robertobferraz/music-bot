@@ -6,11 +6,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-try:
-    import wavelink
-except ImportError:
-    wavelink = None
-
 from botmusica.music.command_domains import command_domain
 
 
@@ -38,8 +33,6 @@ class EventHandlersMixin:
 
     @commands.Cog.listener()
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
-        if payload.guild_id and int(payload.guild_id) in self._control_room_maintenance:
-            return
         for guild_id, state in list(self._control_room_state_cache.items()):
             _channel_id, message_id = state
             if int(payload.message_id) != int(message_id):
@@ -101,78 +94,4 @@ class EventHandlersMixin:
             error_type=type(error).__name__,
             error_code=error_code,
             error=error,
-        )
-
-    @commands.Cog.listener()
-    async def on_wavelink_track_end(self, payload: Any) -> None:
-        if not self.lavalink_enabled or wavelink is None:
-            return
-        player_obj = getattr(payload, "player", None)
-        if player_obj is None or not self._is_lavalink_player(player_obj):
-            return
-        guild = getattr(player_obj, "guild", None)
-        if guild is None:
-            return
-        player = await self._get_player(guild.id)
-        channel_id = self._last_text_channel_id.get(guild.id)
-        text_channel = guild.get_channel(channel_id) if channel_id else None
-        await self._apply_track_finished_state(
-            guild,
-            player,
-            text_channel,
-            playback_error=None,
-            finalize_queue_item=True,
-        )
-
-    @commands.Cog.listener()
-    async def on_wavelink_track_exception(self, payload: Any) -> None:
-        if not self.lavalink_enabled or wavelink is None:
-            return
-        player_obj = getattr(payload, "player", None)
-        if player_obj is None or not self._is_lavalink_player(player_obj):
-            return
-        guild = getattr(player_obj, "guild", None)
-        if guild is None:
-            return
-        exception_obj = getattr(payload, "exception", None)
-        message = getattr(exception_obj, "message", None) or "erro desconhecido no Lavalink"
-        player = await self._get_player(guild.id)
-        channel_id = self._last_text_channel_id.get(guild.id)
-        text_channel = guild.get_channel(channel_id) if channel_id else None
-        current = player.current
-        if current is not None:
-            self._mark_track_ffmpeg_fallback(guild.id, current)
-            self.queue_service.enqueue_front(player, current)
-            player.current = None
-            player.current_started_at = None
-            player.pause_started_at = None
-            player.paused_accumulated_seconds = 0.0
-            player.suppress_after_playback = False
-            player.recovery_requeued_current = False
-            try:
-                player.queue.task_done()
-            except ValueError:
-                pass
-            await self._persist_queue_state(guild.id, player)
-            LOGGER.warning(
-                "Lavalink track exception guild=%s title=%r message=%s. Reenfileirando para fallback FFmpeg.",
-                guild.id,
-                current.title,
-                message,
-            )
-            switched = await self._switch_voice_to_ffmpeg(guild, player_obj)
-            if switched is not None:
-                if text_channel:
-                    await self._send_channel(
-                        text_channel,
-                        self._warn(f"Lavalink falhou nesta faixa. Aplicando fallback FFmpeg: `{message}`"),
-                    )
-                await self._start_next_if_needed(guild, text_channel)
-                return
-        await self._apply_track_finished_state(
-            guild,
-            player,
-            text_channel,
-            playback_error=RuntimeError(str(message)),
-            finalize_queue_item=True,
         )

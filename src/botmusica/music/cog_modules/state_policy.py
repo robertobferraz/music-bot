@@ -103,6 +103,26 @@ class StatePolicyMixin:
         tracks.extend(self._track_to_queue_item(item) for item in player.snapshot_queue())
         return tracks
 
+    async def _drop_restored_queue_if_idle(
+        self,
+        guild_id: int,
+        player: GuildPlayer,
+        *,
+        reason: str,
+    ) -> int:
+        if not player.restored_queue_pending_activation:
+            return 0
+        removed = player.clear_queue()
+        player.current = None
+        player.current_started_at = None
+        player.pause_started_at = None
+        player.paused_accumulated_seconds = 0.0
+        player.pending_seek_seconds = 0
+        player.restored_queue_pending_activation = False
+        await self._persist_queue_state(guild_id, player)
+        LOGGER.info("Fila restaurada descartada no guild %s reason=%s removed=%s", guild_id, reason, len(removed))
+        return len(removed)
+
     async def _persist_queue_state(self, guild_id: int, player: GuildPlayer) -> None:
         await self.queue_repo.save(guild_id, self._build_persisted_queue_tracks(player))
 
@@ -134,11 +154,7 @@ class StatePolicyMixin:
         if guild_id in self._loaded_settings:
             return player
 
-        try:
-            settings = await self.guild_settings_repo.get(guild_id)
-        except Exception:
-            LOGGER.debug("Falha ao carregar guild_settings para guild %s", guild_id, exc_info=True)
-            settings = None
+        settings = await self.guild_settings_repo.get(guild_id)
         if settings:
             player.volume = min(max(settings.volume, 0.01), 2.0)
             player.loop_mode = settings.loop_mode if settings.loop_mode in {"off", "track", "queue"} else "off"
@@ -156,20 +172,24 @@ class StatePolicyMixin:
                 domain_whitelist=set(self.default_domain_whitelist),
                 domain_blacklist=set(self.default_domain_blacklist),
             )
-        try:
-            restored_queue = await self.queue_repo.load(guild_id)
-        except Exception:
-            LOGGER.debug("Falha ao carregar fila persistida para guild %s", guild_id, exc_info=True)
-            restored_queue = []
+        restored_queue = await self.queue_repo.load(guild_id)
         if restored_queue and not player.current and player.queue.empty():
-            for item in restored_queue:
-                await self.queue_service.enqueue(player, self._track_from_queue_item(item))
-            LOGGER.info("Fila restaurada no guild %s com %s item(ns)", guild_id, len(restored_queue))
-        try:
-            runtime_state = await self.store.get_player_runtime_state(guild_id)
-        except Exception:
-            LOGGER.debug("Falha ao carregar player_runtime_state para guild %s", guild_id, exc_info=True)
-            runtime_state = None
+            if self.restore_queue_on_startup:
+                for item in restored_queue:
+                    await self.queue_service.enqueue(player, self._track_from_queue_item(item))
+                player.restored_queue_pending_activation = True
+                LOGGER.info(
+                    "Fila restaurada no guild %s com %s item(ns) em modo dormente",
+                    guild_id,
+                    len(restored_queue),
+                )
+            else:
+                LOGGER.info(
+                    "Fila persistida ignorada no startup do guild %s com %s item(ns)",
+                    guild_id,
+                    len(restored_queue),
+                )
+        runtime_state = await self.store.get_player_runtime_state(guild_id)
         if runtime_state:
             try:
                 restored_state = PlayerState(runtime_state.state)

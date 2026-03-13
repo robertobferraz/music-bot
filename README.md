@@ -208,11 +208,6 @@ kubectl -n botmusica port-forward svc/botmusica-web 8080:8080
 - Falha de busca YouTube: revisar `YTDLP_JS_RUNTIME` e `YTDLP_REMOTE_COMPONENTS`
 - Playlist Spotify com `403` na API oficial: validar o provider externo separadamente com `curl /resolve` antes de testar `/play`
 
-## Notas para publicar no GitHub
-- Não versionar `.env`, `data/`, `*.db`, `__pycache__`, `*.pyc`
-- Revisar segredos em manifests e scripts antes do push
-- Manter `.env.example` como referência pública
-
 ## License
 Este projeto está licenciado sob **MIT** (`MIT`).
 Veja o arquivo [LICENSE](./LICENSE).

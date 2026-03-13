@@ -98,6 +98,10 @@ class MusicResolver:
     async def extract_recommended_track(self, from_track: Track, requester: str) -> Track:
         return await self.music.extract_recommended_track(from_track, requester=requester)
 
+    @staticmethod
+    def _spotify_collection_api_blocked(status: int | None) -> bool:
+        return status != 200
+
     async def extract_batch_with_spotify_fallback(
         self,
         *,
@@ -695,7 +699,7 @@ class MusicResolver:
                     f"albums/{spotify_id}/tracks",
                     params={"limit": str(page_limit), "offset": str(offset)},
                 )
-                if status == 403:
+                if self._spotify_collection_api_blocked(status):
                     raise RuntimeError(
                         "Spotify album nao acessivel pela API. Links de colecao do Spotify dependem de metadados publicos; quando a API bloqueia acesso, o bot nao tenta reproduzir o link direto por DRM."
                     )
@@ -735,7 +739,7 @@ class MusicResolver:
             invalid = 0
             total_items = 0
             summary_status, summary_payload = await self._spotify_playlist_summary(spotify_id)
-            if summary_status == 403:
+            if self._spotify_collection_api_blocked(summary_status):
                 raise RuntimeError(
                     "Spotify playlist nao acessivel pela API. Playlists do Spotify so podem ser convertidas por metadados quando a API permite acesso; o bot nao tenta extrair o link direto por DRM."
                 )
@@ -762,7 +766,7 @@ class MusicResolver:
                     f"playlists/{spotify_id}/items",
                     params=page_params,
                 )
-                if status == 403:
+                if self._spotify_collection_api_blocked(status):
                     raise RuntimeError(
                         "Spotify playlist nao acessivel pela API. Playlists do Spotify so podem ser convertidas por metadados quando a API permite acesso; o bot nao tenta extrair o link direto por DRM."
                     )

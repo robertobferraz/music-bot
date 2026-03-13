@@ -245,7 +245,7 @@ class PostgresSettingsStore:
                 """
                 INSERT INTO guild_settings
                 (guild_id, volume, loop_mode, autoplay, stay_connected, audio_filter, max_track_duration_seconds, domain_whitelist, domain_blacklist)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     volume = excluded.volume,
                     loop_mode = excluded.loop_mode,

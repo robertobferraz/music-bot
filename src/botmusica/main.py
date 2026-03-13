@@ -62,7 +62,9 @@ class MusicaBot(commands.Bot):
         if self.test_guild_id:
             guild_obj = discord.Object(id=self.test_guild_id)
             self.tree.copy_global_to(guild=guild_obj)
+            self.tree.clear_commands(guild=None)
             await self.tree.sync(guild=guild_obj)
+            await self.tree.sync()
             LOGGER.info("Comandos sincronizados no guild de teste %s (modo guild-only)", self.test_guild_id)
             return
         await self.tree.sync()

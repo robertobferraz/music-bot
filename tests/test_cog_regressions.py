@@ -200,6 +200,7 @@ def test_resolver_spotify_playlist_converts_all_items_to_search_queries() -> Non
             spotify_meta_cache_ttl_seconds=60,
             spotify_meta_cache_max_entries=32,
         )
+        resolver._spotify_batch_via_api = lambda *_a, **_k: asyncio.sleep(0, result=None)  # type: ignore[method-assign]
         try:
             batch, used_spotify = await resolver.extract_batch_with_spotify_fallback(
                 link="https://open.spotify.com/playlist/abc123",

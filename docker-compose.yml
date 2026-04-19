@@ -28,6 +28,9 @@ services:
       - "traefik.http.routers.botmusica.tls=true"
       - "traefik.http.routers.botmusica.tls.certresolver=letsencrypt"
       - "traefik.http.services.botmusica.loadbalancer.server.port=8080"
+      - "traefik.http.middlewares.botmusica-ws.headers.customrequestheaders.Connection=keep-alive,Upgrade"
+      - "traefik.http.middlewares.botmusica-ws.headers.customrequestheaders.Upgrade=websocket"
+      - "traefik.http.routers.botmusica.middlewares=botmusica-ws"
     healthcheck:
       test:
         - CMD-SHELL

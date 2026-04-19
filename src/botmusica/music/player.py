@@ -31,9 +31,11 @@ YTDL_OPTIONS: dict[str, Any] = {
     "fragment_retries": 5,
     "socket_timeout": 15,
     "ignoreerrors": True,
-    # Evita ios por causa de PO Token, mas mantém android_vr como alternativa
-    # mais resiliente quando web retorna URLs SABR/403.
-    "extractor_args": {"youtube": {"player_client": ["android_vr", "web"]}},
+    # Ordem de preferência de clientes:
+    # - tv_embedded: mais resistente ao bot detection sem precisar de cookies
+    # - android_vr: alternativa quando web retorna URLs SABR/403
+    # - web: fallback padrão
+    "extractor_args": {"youtube": {"player_client": ["tv_embedded", "android_vr", "web"]}},
 }
 
 BASE_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
@@ -414,7 +416,6 @@ class MusicService:
         cleaned = re.sub(r"[\[\](){}|]+", " ", cleaned)
         cleaned = re.sub(r"\b(feat|ft)\.?\b.*$", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\b(official|video|audio|lyrics|visualizer|remaster(?:ed)?)\b", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\bde\s+toy\s+story\b", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_:")
         return cleaned
 

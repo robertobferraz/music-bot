@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import discord
@@ -8,8 +9,91 @@ from discord.ext import commands
 
 from botmusica.music.command_domains import command_domain
 
+LOGGER = logging.getLogger("botmusica.music")
+
 
 class EventHandlersMixin:
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """Detect when the bot is left alone in a voice channel and auto-disconnect."""
+        # Ignore the bot's own state changes for the alone-check logic.
+        if member.id == self.bot.user.id:
+            # If the bot was disconnected externally, clean up state.
+            if before.channel is not None and after.channel is None:
+                guild = member.guild
+                player = await self._get_player(guild.id)
+                await self._persist_queue_state(guild.id, player)
+                self._cancel_prefetch(guild.id)
+                self._cancel_idle_timer(guild.id)
+                self._cancel_playback_watchdog(guild.id)
+                await self._clear_votes_for_guild(guild.id)
+                await self._clear_nowplaying_message(guild.id)
+                await self._clear_voice_mini_panel(guild.id)
+                self.music.remove_player(guild.id)
+                self._loaded_settings.discard(guild.id)
+                from botmusica.music.services.player_state import PlayerState
+                self._set_player_state(guild.id, PlayerState.IDLE, reason="bot_disconnected_externally")
+            return
+
+        guild = member.guild
+        voice_client = guild.voice_client
+        if voice_client is None or not self._is_voice_connected(voice_client):
+            return
+
+        bot_channel = getattr(voice_client, "channel", None)
+        if bot_channel is None:
+            return
+
+        # Only act when someone leaves the bot's channel.
+        if before.channel != bot_channel:
+            return
+
+        # Count non-bot members remaining in the channel.
+        human_members = sum(1 for m in bot_channel.members if not m.bot)
+        if human_members > 0:
+            return
+
+        # Bot is alone — check if stay_connected (24/7 mode) is on.
+        player = await self._get_player(guild.id)
+        if player.stay_connected:
+            return
+
+        LOGGER.info("Bot ficou sozinho no canal de voz do guild %s. Desconectando.", guild.id)
+        self._log_event("alone_disconnect", guild=guild.id, channel=bot_channel.id)
+
+        try:
+            await self._stop_voice(voice_client)
+        except Exception:
+            LOGGER.debug("Falha ao parar voz antes do alone disconnect guild %s", guild.id, exc_info=True)
+
+        self._mark_voice_reconnect_required(guild.id)
+        await voice_client.disconnect(force=True)
+        await self._clear_nowplaying_message(guild.id)
+        await self._clear_voice_mini_panel(guild.id)
+        await self._clear_votes_for_guild(guild.id)
+        self._cancel_playback_watchdog(guild.id)
+        self._cancel_idle_timer(guild.id)
+        self.music.remove_player(guild.id)
+        self._loaded_settings.discard(guild.id)
+
+        from botmusica.music.services.player_state import PlayerState
+        self._set_player_state(guild.id, PlayerState.IDLE, reason="alone_disconnect")
+
+        # Try to notify a text channel about the disconnect.
+        text_channel_id = self._last_text_channel_id.get(guild.id)
+        if text_channel_id:
+            channel = guild.get_channel(text_channel_id)
+            if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                try:
+                    await self._send_channel(channel, self._note("Desconectado porque fiquei sozinho no canal de voz."))
+                except Exception:
+                    pass
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         # A sala de controle aceita somente mensagens do bot.

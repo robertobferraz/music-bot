@@ -634,6 +634,57 @@ class MusicCog(
     def _build_help_embed(self, category: str) -> discord.Embed:
         return self.embeds.build_help_embed(category)
 
+    def _prune_expired_caches(self) -> None:
+        """Remove expired entries from unbounded in-memory dicts to prevent memory leaks."""
+        now = time.monotonic()
+
+        # Prune cooldowns (user command cooldowns).
+        expired_cooldowns = [k for k, expires_at in self._cooldowns.items() if expires_at <= now]
+        for k in expired_cooldowns:
+            del self._cooldowns[k]
+
+        # Prune button cooldowns.
+        expired_btn = [k for k, expires_at in self._interaction_button_cooldowns.items() if expires_at <= now]
+        for k in expired_btn:
+            del self._interaction_button_cooldowns[k]
+
+        # Prune button debounce.
+        expired_debounce = [k for k, until in self._button_debounce_until.items() if until <= now]
+        for k in expired_debounce:
+            del self._button_debounce_until[k]
+
+        # Prune autocomplete rank cache.
+        expired_ac = [k for k, (expires_at, _) in self._autocomplete_rank_cache.items() if expires_at <= now]
+        for k in expired_ac:
+            del self._autocomplete_rank_cache[k]
+
+        # Prune rate limit buckets that have been idle (all entries expired from window).
+        for store in (self._rate_user, self._rate_guild, self._rate_channel):
+            empty_keys = [k for k, bucket in store.items() if not bucket or (now - bucket[-1]) > 120]
+            for k in empty_keys:
+                del store[k]
+
+        # Prune per-guild dicts for guilds the bot is no longer in.
+        active_guild_ids = {g.id for g in self.bot.guilds}
+        for guild_dict in (
+            self._play_locks,
+            self._idle_tasks,
+            self._last_text_channel_id,
+            self._control_room_operator,
+            self._control_room_action_locks,
+            self._control_room_preset_cursor,
+            self._guild_policy,
+            self._last_health_alert_at,
+        ):
+            stale = [gid for gid in guild_dict if isinstance(gid, int) and gid not in active_guild_ids]
+            for gid in stale:
+                guild_dict.pop(gid, None)
+
+        # Prune domain locks for gone guilds.
+        stale_domain = [k for k in self._domain_locks if isinstance(k, tuple) and k[0] not in active_guild_ids]
+        for k in stale_domain:
+            del self._domain_locks[k]
+
     @staticmethod
     def _ok(message: str) -> str:
         return f"✅ {message}"

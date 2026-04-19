@@ -624,6 +624,8 @@ class RuntimePlaybackMixin:
                     await self.store.prune_search_cache(
                         max_age_seconds=int(self.search_cache_ttl_seconds + self.search_cache_stale_ttl_seconds + 60),
                     )
+                    # Prune expired entries from unbounded in-memory caches.
+                    self._prune_expired_caches()
                 if self.state_snapshot_interval_ticks > 0 and self._health_ticks % self.state_snapshot_interval_ticks == 0:
                     await self._snapshot_all_states()
                 if self._health_ticks % 4 == 0:

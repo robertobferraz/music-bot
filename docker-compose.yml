@@ -21,6 +21,13 @@ services:
     ports:
       - '127.0.0.1:18080:8080'
       - '127.0.0.1:18090:8090'
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.botmusica.rule=Host(`panel.robertobferraz.dev`)"
+      - "traefik.http.routers.botmusica.entrypoints=https"
+      - "traefik.http.routers.botmusica.tls=true"
+      - "traefik.http.routers.botmusica.tls.certresolver=letsencrypt"
+      - "traefik.http.services.botmusica.loadbalancer.server.port=8080"
     healthcheck:
       test:
         - CMD-SHELL
@@ -34,6 +41,7 @@ services:
         condition: service_healthy
     networks:
       - music-network
+      - coolify
     logging:
       driver: json-file
       options:
@@ -63,6 +71,7 @@ services:
       start_period: 15s
     networks:
       - music-network
+      - coolify
     logging:
       driver: json-file
       options:
@@ -71,4 +80,6 @@ services:
 
 networks:
   music-network:
+    external: true
+  coolify:
     external: true

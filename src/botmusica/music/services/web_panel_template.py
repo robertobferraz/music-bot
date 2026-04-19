@@ -813,8 +813,8 @@ def build_web_panel_html() -> str:
       refs.commandErrors.textContent=String(payload.metrics?.command_errors||0);
       refs.avgLatency.textContent=`${fmtMs(payload.metrics?.average_latency_ms)} ms`;
       refs.uptime.textContent=fmtUptime(payload.runtime?.uptime_seconds);
-      refs.runtimeBackend.textContent=payload.runtime?.repository_backend||'-';
-      refs.sideBackend.textContent=payload.runtime?.repository_backend||'-';
+      if(refs.runtimeBackend) refs.runtimeBackend.textContent=payload.runtime?.repository_backend||'-'; 
+      if(refs.sideBackend) refs.sideBackend.textContent=payload.runtime?.repository_backend||'-';
       refs.sideGuilds.textContent=String(guilds.length);
       const slo=payload.metrics?.slo_5m||{};
       refs.p95Play.textContent=fmtMs(slo.play_p95_ms);

@@ -15,6 +15,22 @@ LOGGER = logging.getLogger("botmusica.music")
 
 
 class RuntimePlaybackMixin:
+    @staticmethod
+    def _ffmpeg_process_returncode(source: discord.AudioSource | object) -> int | None:
+        original = getattr(source, "original", source)
+        process = getattr(original, "_process", None)
+        poll = getattr(process, "poll", None)
+        if not callable(poll):
+            return None
+        return poll()
+
+    @staticmethod
+    def _ffmpeg_process_pid(source: discord.AudioSource | object) -> int | None:
+        original = getattr(source, "original", source)
+        process = getattr(original, "_process", None)
+        pid = getattr(process, "pid", None)
+        return int(pid) if isinstance(pid, int) else None
+
     def _cancel_playback_watchdog(self, guild_id: int) -> None:
         task = self._playback_watchdog_tasks.pop(guild_id, None)
         if task and not task.done():
@@ -631,14 +647,12 @@ class RuntimePlaybackMixin:
                     audio_filter=player.audio_filter,
                     start_seconds=seek_seconds,
                 )
-                original = getattr(source, "original", source)
-                process = getattr(original, "_process", None)
                 LOGGER.info(
                     "start_next source_ready guild=%s title=%s source_type=%s ffmpeg_pid=%s",
                     guild.id,
                     track.title,
                     type(source).__name__,
-                    getattr(process, "pid", None),
+                    self._ffmpeg_process_pid(source),
                 )
             except Exception as exc:
                 self._set_player_state(guild.id, PlayerState.ERROR, reason="stream_prepare_failed")
@@ -663,12 +677,18 @@ class RuntimePlaybackMixin:
 
             def after_playback(err: Exception | None) -> None:
                 nonlocal playback_error
-                playback_error = err
+                returncode = self._ffmpeg_process_returncode(source)
+                if err is not None:
+                    playback_error = err
+                elif returncode not in (None, 0):
+                    playback_error = RuntimeError(f"FFmpeg saiu com codigo {returncode}.")
+                    self.music.drop_stream_cache(track.source_query)
                 LOGGER.warning(
-                    "voice_after_callback guild=%s title=%s error=%r",
+                    "voice_after_callback guild=%s title=%s error=%r ffmpeg_returncode=%s",
                     guild.id,
                     track.title,
-                    err,
+                    playback_error,
+                    returncode,
                 )
                 self.bot.loop.call_soon_threadsafe(finished.set)
 
@@ -701,16 +721,14 @@ class RuntimePlaybackMixin:
                 await self._start_next_if_needed(guild, text_channel)
                 return
             player.current_started_at = time.monotonic()
-            original = getattr(source, "original", source)
-            process = getattr(original, "_process", None)
             LOGGER.info(
                 "voice_play_started guild=%s title=%s playing_after=%s paused_after=%s ffmpeg_pid=%s ffmpeg_returncode=%s",
                 guild.id,
                 track.title,
                 self._is_voice_playing(voice_client),
                 self._is_voice_paused(voice_client),
-                getattr(process, "pid", None),
-                process.poll() if process is not None else None,
+                self._ffmpeg_process_pid(source),
+                self._ffmpeg_process_returncode(source),
             )
             self._schedule_prefetch_next(guild.id, player)
             await self._upsert_nowplaying_message(guild, text_channel)
@@ -722,8 +740,6 @@ class RuntimePlaybackMixin:
                 await asyncio.sleep(2.0)
                 current_voice = guild.voice_client
                 current_player = await self._get_player(guild.id)
-                original_source = getattr(source, "original", source)
-                ffmpeg_process = getattr(original_source, "_process", None)
                 LOGGER.info(
                     "voice_play_probe guild=%s title=%s connected=%s usable=%s playing=%s paused=%s "
                     "current=%s queue_size=%s ffmpeg_pid=%s ffmpeg_returncode=%s",
@@ -735,8 +751,8 @@ class RuntimePlaybackMixin:
                     self._is_voice_paused(current_voice),
                     current_player.current.title if current_player.current else None,
                     len(current_player.snapshot_queue()),
-                    getattr(ffmpeg_process, "pid", None),
-                    ffmpeg_process.poll() if ffmpeg_process is not None else None,
+                    self._ffmpeg_process_pid(source),
+                    self._ffmpeg_process_returncode(source),
                 )
 
             self.bot.loop.create_task(playback_probe())

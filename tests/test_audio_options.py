@@ -14,3 +14,46 @@ def test_ffmpeg_options_include_seek_and_filter() -> None:
     assert "asetrate" in opts["options"]
     assert "-ac " not in opts["options"]
     assert "-ar " not in opts["options"]
+
+
+def test_stream_from_payload_prefers_audio_only_over_web_muxed_format() -> None:
+    stream_url, _headers = MusicService._stream_from_payload(
+        {
+            "formats": [
+                {
+                    "format_id": "18",
+                    "url": "https://rr.googlevideo.com/videoplayback?c=WEB&mime=video%2Fmp4",
+                    "acodec": "mp4a.40.2",
+                    "vcodec": "avc1.42001E",
+                    "ext": "mp4",
+                    "abr": 96,
+                    "asr": 44100,
+                },
+                {
+                    "format_id": "251",
+                    "url": "https://rr.googlevideo.com/videoplayback?c=ANDROID_VR&mime=audio%2Fwebm",
+                    "acodec": "opus",
+                    "vcodec": "none",
+                    "ext": "webm",
+                    "abr": 160,
+                    "asr": 48000,
+                },
+            ]
+        }
+    )
+
+    assert "mime=audio%2Fwebm" in stream_url
+
+
+def test_stream_from_payload_rejects_muxed_direct_url() -> None:
+    stream_url, _headers = MusicService._stream_from_payload(
+        {
+            "format_id": "18",
+            "url": "https://rr.googlevideo.com/videoplayback?c=WEB&mime=video%2Fmp4",
+            "acodec": "mp4a.40.2",
+            "vcodec": "avc1.42001E",
+            "ext": "mp4",
+        }
+    )
+
+    assert stream_url is None

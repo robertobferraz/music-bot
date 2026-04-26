@@ -124,6 +124,18 @@ def test_ensure_voice_reconnects_same_channel_when_session_unusable() -> None:
     asyncio.run(_run())
 
 
+def test_ffmpeg_process_returncode_handles_cleaned_up_source() -> None:
+    from discord.utils import MISSING
+
+    loop = asyncio.new_event_loop()
+    try:
+        cog = _build_cog(loop)
+        source = SimpleNamespace(original=SimpleNamespace(_process=MISSING))
+        assert cog._ffmpeg_process_returncode(source) is None
+    finally:
+        loop.close()
+
+
 def test_resolver_spotify_fallback_prefers_best_candidate() -> None:
     class FakeMusic:
         async def extract_track(self, link: str, requester: str) -> Track:

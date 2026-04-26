@@ -371,6 +371,11 @@ class MusicService:
         while len(self._stream_url_cache) > self._cache_max_entries:
             self._stream_url_cache.popitem(last=False)
 
+    def drop_stream_cache(self, source_query: str) -> None:
+        removed = self._stream_url_cache.pop(source_query, None)
+        if removed is not None:
+            LOGGER.info("stream_cache drop query=%s", self._redact_url_for_log(source_query))
+
     @staticmethod
     def _redact_url_for_log(value: str | None) -> str:
         raw = (value or "").strip()
@@ -618,6 +623,22 @@ class MusicService:
 
         direct_url = payload.get("url")
         if isinstance(direct_url, str) and direct_url.strip():
+            if not cls._is_audio_capable_format(payload):
+                LOGGER.info(
+                    "build_audio_source ignored direct url without audio format metadata extractor=%s vcodec=%s acodec=%s",
+                    payload.get("extractor"),
+                    payload.get("vcodec"),
+                    payload.get("acodec"),
+                )
+                return None, {}
+            if str(payload.get("vcodec") or "none").casefold() != "none":
+                LOGGER.info(
+                    "build_audio_source ignored muxed direct url extractor=%s format_id=%s client=%s",
+                    payload.get("extractor"),
+                    payload.get("format_id"),
+                    cls._format_client_tag(payload),
+                )
+                return None, {}
             return direct_url.strip(), cls._headers_from_payload(payload)
         return None, {}
 

@@ -59,6 +59,27 @@ def test_stream_from_payload_rejects_muxed_direct_url() -> None:
     assert stream_url is None
 
 
+def test_stream_from_payload_rejects_formats_when_only_muxed_available() -> None:
+    stream_url, _headers = MusicService._stream_from_payload(
+        {
+            "extractor": "youtube",
+            "formats": [
+                {
+                    "format_id": "18",
+                    "url": "https://rr.googlevideo.com/videoplayback?c=WEB&mime=video%2Fmp4",
+                    "acodec": "mp4a.40.2",
+                    "vcodec": "avc1.42001E",
+                    "ext": "mp4",
+                    "abr": 96,
+                    "asr": 44100,
+                }
+            ],
+        }
+    )
+
+    assert stream_url is None
+
+
 def test_drop_stream_cache_also_drops_extract_cache() -> None:
     service = MusicService()
     query = "https://www.youtube.com/watch?v=abc"

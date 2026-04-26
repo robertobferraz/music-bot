@@ -626,6 +626,13 @@ class MusicService:
             ]
             if audio_candidates:
                 audio_only_candidates = [item for item in audio_candidates if cls._is_audio_only_format(item)]
+                if not audio_only_candidates:
+                    LOGGER.info(
+                        "build_audio_source skipped muxed formats only count=%s extractor=%s",
+                        len(audio_candidates),
+                        payload.get("extractor"),
+                    )
+                    return None, {}
                 preferred = sorted(audio_only_candidates or audio_candidates, key=cls._format_preference_key)[0]
                 LOGGER.info(
                     "build_audio_source selected format id=%s acodec=%s vcodec=%s ext=%s client=%s audio_only_available=%s",

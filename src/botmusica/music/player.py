@@ -373,8 +373,14 @@ class MusicService:
 
     def drop_stream_cache(self, source_query: str) -> None:
         removed = self._stream_url_cache.pop(source_query, None)
+        extract_removed = self._extract_cache.pop(f"stream:{source_query}", None)
+        canonical_query = self._canonicalize_query_url(source_query)
+        if canonical_query != source_query:
+            self._extract_cache.pop(f"stream:{canonical_query}", None)
         if removed is not None:
             LOGGER.info("stream_cache drop query=%s", self._redact_url_for_log(source_query))
+        if extract_removed is not None:
+            LOGGER.info("extract_cache drop key=stream:%s", self._redact_url_for_log(source_query))
 
     @staticmethod
     def _redact_url_for_log(value: str | None) -> str:
@@ -571,6 +577,12 @@ class MusicService:
             return False
         return True
 
+    @staticmethod
+    def _is_audio_only_format(item: dict[str, Any]) -> bool:
+        if not MusicService._is_audio_capable_format(item):
+            return False
+        return str(item.get("vcodec") or "none").casefold() == "none"
+
     @classmethod
     def _format_preference_key(cls, item: dict[str, Any]) -> tuple[int, int, int, int, float, float]:
         client_tag = cls._format_client_tag(item)
@@ -586,19 +598,22 @@ class MusicService:
     def _stream_from_payload(cls, payload: dict[str, Any]) -> tuple[str | None, dict[str, str]]:
         requested_formats = payload.get("requested_formats")
         if isinstance(requested_formats, list):
+            requested_candidates = [item for item in requested_formats if cls._is_audio_capable_format(item)]
+            requested_audio_only = [item for item in requested_candidates if cls._is_audio_only_format(item)]
             preferred_requested = sorted(
-                [item for item in requested_formats if cls._is_audio_capable_format(item)],
+                requested_audio_only or requested_candidates,
                 key=cls._format_preference_key,
             )
             audio_format = preferred_requested[0] if preferred_requested else None
             if isinstance(audio_format, dict):
                 LOGGER.info(
-                    "build_audio_source selected requested_format id=%s acodec=%s vcodec=%s ext=%s client=%s",
+                    "build_audio_source selected requested_format id=%s acodec=%s vcodec=%s ext=%s client=%s audio_only_available=%s",
                     audio_format.get("format_id"),
                     audio_format.get("acodec"),
                     audio_format.get("vcodec"),
                     audio_format.get("ext"),
                     cls._format_client_tag(audio_format),
+                    bool(requested_audio_only),
                 )
                 return str(audio_format.get("url") or ""), cls._headers_from_payload(audio_format)
 
@@ -610,14 +625,16 @@ class MusicService:
                 if cls._is_audio_capable_format(item)
             ]
             if audio_candidates:
-                preferred = sorted(audio_candidates, key=cls._format_preference_key)[0]
+                audio_only_candidates = [item for item in audio_candidates if cls._is_audio_only_format(item)]
+                preferred = sorted(audio_only_candidates or audio_candidates, key=cls._format_preference_key)[0]
                 LOGGER.info(
-                    "build_audio_source selected format id=%s acodec=%s vcodec=%s ext=%s client=%s",
+                    "build_audio_source selected format id=%s acodec=%s vcodec=%s ext=%s client=%s audio_only_available=%s",
                     preferred.get("format_id"),
                     preferred.get("acodec"),
                     preferred.get("vcodec"),
                     preferred.get("ext"),
                     cls._format_client_tag(preferred),
+                    bool(audio_only_candidates),
                 )
                 return str(preferred.get("url") or ""), cls._headers_from_payload(preferred)
 

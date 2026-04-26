@@ -57,3 +57,15 @@ def test_stream_from_payload_rejects_muxed_direct_url() -> None:
     )
 
     assert stream_url is None
+
+
+def test_drop_stream_cache_also_drops_extract_cache() -> None:
+    service = MusicService()
+    query = "https://www.youtube.com/watch?v=abc"
+    service._stream_url_cache[query] = (999999999.0, "https://example.com/stream", {})  # noqa: SLF001
+    service._extract_cache[f"stream:{query}"] = (999999999.0, {"url": "https://example.com/stream"})  # noqa: SLF001
+
+    service.drop_stream_cache(query)
+
+    assert query not in service._stream_url_cache  # noqa: SLF001
+    assert f"stream:{query}" not in service._extract_cache  # noqa: SLF001

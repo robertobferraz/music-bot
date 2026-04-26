@@ -7,6 +7,22 @@ def test_filter_dictionary_has_expected_modes() -> None:
     assert {"off", "bassboost", "nightcore", "vaporwave", "karaoke"}.issubset(set(FILTERS))
 
 
+def test_youtube_player_clients_default_uses_supported_cookie_compatible_clients(monkeypatch) -> None:
+    monkeypatch.delenv("YTDLP_YOUTUBE_CLIENTS", raising=False)
+
+    clients = MusicService._youtube_player_clients_from_env()
+
+    assert clients[:3] == ["tv_downgraded", "web_safari", "mweb"]
+    assert "tv_embedded" not in clients
+    assert "android_vr" not in clients
+
+
+def test_youtube_player_clients_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("YTDLP_YOUTUBE_CLIENTS", "web_safari,web")
+
+    assert MusicService._youtube_player_clients_from_env() == ["web_safari", "web"]
+
+
 def test_ffmpeg_options_include_seek_and_filter() -> None:
     opts = MusicService._build_ffmpeg_options(audio_filter="nightcore", start_seconds=42)
     assert "-ss 42" in opts["before_options"]

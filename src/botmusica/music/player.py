@@ -18,6 +18,8 @@ import yt_dlp
 
 LOGGER = __import__("logging").getLogger("botmusica.music")
 
+DEFAULT_YOUTUBE_CLIENTS = ("tv_downgraded", "web_safari", "mweb", "web_embedded", "web")
+
 YTDL_OPTIONS: dict[str, Any] = {
     "format": "bestaudio[acodec^=opus]/bestaudio[ext=webm]/bestaudio/best",
     "noplaylist": True,
@@ -31,11 +33,7 @@ YTDL_OPTIONS: dict[str, Any] = {
     "fragment_retries": 5,
     "socket_timeout": 15,
     "ignoreerrors": True,
-    # Ordem de preferência de clientes:
-    # - tv_embedded: mais resistente ao bot detection sem precisar de cookies
-    # - android_vr: alternativa quando web retorna URLs SABR/403
-    # - web: fallback padrão
-    "extractor_args": {"youtube": {"player_client": ["tv_embedded", "android_vr", "web"]}},
+    "extractor_args": {"youtube": {"player_client": list(DEFAULT_YOUTUBE_CLIENTS)}},
 }
 
 BASE_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
@@ -172,6 +170,11 @@ class MusicService:
 
         remote_components = os.getenv("YTDLP_REMOTE_COMPONENTS", "ejs:github").strip()
         ytdl_options = dict(YTDL_OPTIONS)
+        ytdl_options["extractor_args"] = {
+            "youtube": {
+                "player_client": self._youtube_player_clients_from_env(),
+            }
+        }
         if self._fast_mode:
             ytdl_options["retries"] = 2
             ytdl_options["extractor_retries"] = 1
@@ -229,6 +232,14 @@ class MusicService:
             "spotify": asyncio.Semaphore(provider_limit),
             "other": asyncio.Semaphore(provider_limit),
         }
+
+    @staticmethod
+    def _youtube_player_clients_from_env() -> list[str]:
+        raw = os.getenv("YTDLP_YOUTUBE_CLIENTS", "").strip()
+        if not raw:
+            return list(DEFAULT_YOUTUBE_CLIENTS)
+        clients = [item.strip() for item in raw.split(",") if item.strip()]
+        return clients or list(DEFAULT_YOUTUBE_CLIENTS)
 
     @staticmethod
     def _prepare_cookiefile(cookiefile: str) -> str:

@@ -86,6 +86,44 @@ def test_is_voice_connected_native_compatibility() -> None:
         loop.close()
 
 
+def test_ensure_voice_reconnects_same_channel_when_session_unusable() -> None:
+    async def _run() -> None:
+        cog = _build_cog(asyncio.get_running_loop())
+
+        channel = SimpleNamespace(id=55)
+        stale_voice = SimpleNamespace(
+            channel=channel,
+            disconnected=False,
+            is_connected=lambda: True,
+        )
+        fresh_voice = SimpleNamespace(channel=channel, is_connected=lambda: True)
+        guild = SimpleNamespace(id=1, voice_client=stale_voice)
+        interaction = SimpleNamespace(guild=guild, channel=SimpleNamespace(id=99))
+
+        async def _disconnect(*, force: bool = False) -> None:
+            assert force is True
+            stale_voice.disconnected = True
+            guild.voice_client = None
+
+        async def _connect(_guild: object, _channel: object) -> object:
+            guild.voice_client = fresh_voice
+            return fresh_voice
+
+        stale_voice.disconnect = _disconnect
+        cog._require_user_voice_channel = lambda _interaction: asyncio.sleep(0, result=channel)  # type: ignore[method-assign]
+        cog._is_voice_session_usable = lambda _guild, voice: voice is fresh_voice  # type: ignore[method-assign]
+        cog._connect_native_voice_with_retry = _connect  # type: ignore[method-assign]
+        cog._upsert_voice_mini_panel = lambda *_a, **_k: asyncio.sleep(0)  # type: ignore[method-assign]
+
+        connected = await cog._ensure_voice(interaction)
+
+        assert connected is fresh_voice
+        assert stale_voice.disconnected is True
+        assert guild.voice_client is fresh_voice
+
+    asyncio.run(_run())
+
+
 def test_resolver_spotify_fallback_prefers_best_candidate() -> None:
     class FakeMusic:
         async def extract_track(self, link: str, requester: str) -> Track:

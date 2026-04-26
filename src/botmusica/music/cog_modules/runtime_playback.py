@@ -325,13 +325,11 @@ class RuntimePlaybackMixin:
         # Nao forca reconnect agressivo quando o bot ja esta no canal.
         force_reconnect = guild.id in self._voice_reconnect_required
 
-        # Se ja esta no mesmo canal do usuario e aparenta conectado, reaproveita a sessao.
+        # Se ja esta no mesmo canal do usuario e a sessao ainda esta sincronizada,
+        # reaproveita a conexao. Depois de idle, o VoiceClient pode continuar
+        # reportando is_connected() mesmo sem guild.me.voice consistente.
         if existing is not None and getattr(existing, "channel", None) == user_channel:
-            try:
-                native_connected = existing.is_connected() if hasattr(existing, "is_connected") else False
-            except Exception:
-                native_connected = False
-            if native_connected:
+            if self._is_voice_session_usable(guild, existing):
                 self._clear_voice_reconnect_required(guild.id)
                 self._set_player_state(guild.id, PlayerState.IDLE, reason="voice_reused_same_channel")
                 try:

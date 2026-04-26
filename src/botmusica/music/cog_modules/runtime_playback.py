@@ -224,11 +224,6 @@ class RuntimePlaybackMixin:
                 finished_track.title,
                 playback_error,
             )
-            if text_channel:
-                await self._send_channel(
-                    text_channel,
-                    self._warn(f"Stream falhou para `{finished_track.title}`. Tentando novamente com uma URL nova..."),
-                )
             await self._start_next_if_needed(guild, text_channel)
             return
 

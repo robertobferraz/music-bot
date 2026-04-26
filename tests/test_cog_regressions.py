@@ -158,7 +158,7 @@ def test_playback_error_requeues_track_once() -> None:
 
         assert player.current is None
         assert [item.title for item in player.snapshot_queue()] == ["track-a"]
-        assert calls == {"persist": 1, "started": 1, "sent": 1}
+        assert calls == {"persist": 1, "started": 1, "sent": 0}
 
     asyncio.run(_run())
 
@@ -187,7 +187,7 @@ def test_playback_error_retry_does_not_loop_forever() -> None:
 
         assert player.current is None
         assert player.snapshot_queue() == []
-        assert len(sent) == 2
+        assert len(sent) == 1
 
     asyncio.run(_run())
 

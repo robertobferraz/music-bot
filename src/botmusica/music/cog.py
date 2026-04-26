@@ -174,6 +174,7 @@ class MusicCog(
         self._voice_became_idle_at: dict[int, float] = {}
         self._voice_refresh_in_progress: set[int] = set()
         self._playback_watchdog_tasks: dict[int, asyncio.Task[None]] = {}
+        self._playback_error_retries: dict[tuple[int, str], int] = {}
         self._control_room_state_cache: dict[int, tuple[int, int]] = {}
         self._control_room_operator: dict[int, int] = {}
         self._control_room_action_locks: dict[int, asyncio.Lock] = {}

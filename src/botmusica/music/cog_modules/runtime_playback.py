@@ -177,6 +177,21 @@ class RuntimePlaybackMixin:
         if isinstance(voice_client.source, discord.PCMVolumeTransformer):
             voice_client.source.volume = normalized
 
+    def _playback_retry_key(self, guild_id: int, track: Track) -> tuple[int, str]:
+        key_source = getattr(self.music, "_canonicalize_query_url", lambda value: value)(track.source_query)
+        return guild_id, f"{key_source}|{track.title}"
+
+    def _consume_playback_error_retry(self, guild_id: int, track: Track) -> bool:
+        key = self._playback_retry_key(guild_id, track)
+        attempts = self._playback_error_retries.get(key, 0)
+        if attempts >= 1:
+            return False
+        self._playback_error_retries[key] = attempts + 1
+        return True
+
+    def _clear_playback_error_retry(self, guild_id: int, track: Track) -> None:
+        self._playback_error_retries.pop(self._playback_retry_key(guild_id, track), None)
+
     async def _apply_track_finished_state(
         self,
         guild: discord.Guild,
@@ -199,11 +214,30 @@ class RuntimePlaybackMixin:
             except ValueError:
                 pass
 
+        if playback_error and finished_track and self._consume_playback_error_retry(guild.id, finished_track):
+            self.queue_service.enqueue_front(player, finished_track)
+            await self._persist_queue_state(guild.id, player)
+            self._set_player_state(guild.id, PlayerState.RECOVERING, reason="playback_error_retry")
+            LOGGER.warning(
+                "playback_error_retry guild=%s title=%s error=%r",
+                guild.id,
+                finished_track.title,
+                playback_error,
+            )
+            if text_channel:
+                await self._send_channel(
+                    text_channel,
+                    self._warn(f"Stream falhou para `{finished_track.title}`. Tentando novamente com uma URL nova..."),
+                )
+            await self._start_next_if_needed(guild, text_channel)
+            return
+
         if playback_error and text_channel:
             await self._send_channel(text_channel, self._error(f"Erro ao reproduzir audio: `{playback_error}`"))
             self._set_player_state(guild.id, PlayerState.ERROR, reason="playback_error")
 
         if finished_track and not playback_error and not skip_postplay:
+            self._clear_playback_error_retry(guild.id, finished_track)
             self._remember_finished_track(guild.id, finished_track)
             if player.loop_mode == "track":
                 self.queue_service.enqueue_front(player, finished_track)

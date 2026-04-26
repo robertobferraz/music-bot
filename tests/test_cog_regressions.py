@@ -136,6 +136,62 @@ def test_ffmpeg_process_returncode_handles_cleaned_up_source() -> None:
         loop.close()
 
 
+def test_playback_error_requeues_track_once() -> None:
+    async def _run() -> None:
+        cog = _build_cog(asyncio.get_running_loop())
+        player = GuildPlayer(guild_id=1)
+        track = Track(
+            source_query="https://www.youtube.com/watch?v=abc",
+            title="track-a",
+            webpage_url="https://www.youtube.com/watch?v=abc",
+            requested_by="tester",
+        )
+        player.current = track
+        guild = SimpleNamespace(id=1)
+        calls = {"persist": 0, "started": 0, "sent": 0}
+
+        cog._persist_queue_state = lambda *_a, **_k: asyncio.sleep(0, result=calls.__setitem__("persist", calls["persist"] + 1))  # type: ignore[method-assign]
+        cog._start_next_if_needed = lambda *_a, **_k: asyncio.sleep(0, result=calls.__setitem__("started", calls["started"] + 1))  # type: ignore[method-assign]
+        cog._send_channel = lambda *_a, **_k: asyncio.sleep(0, result=calls.__setitem__("sent", calls["sent"] + 1))  # type: ignore[method-assign]
+
+        await cog._apply_track_finished_state(guild, player, SimpleNamespace(), playback_error=RuntimeError("ffmpeg 8"))
+
+        assert player.current is None
+        assert [item.title for item in player.snapshot_queue()] == ["track-a"]
+        assert calls == {"persist": 1, "started": 1, "sent": 1}
+
+    asyncio.run(_run())
+
+
+def test_playback_error_retry_does_not_loop_forever() -> None:
+    async def _run() -> None:
+        cog = _build_cog(asyncio.get_running_loop())
+        player = GuildPlayer(guild_id=1)
+        track = Track(
+            source_query="https://www.youtube.com/watch?v=abc",
+            title="track-a",
+            webpage_url="https://www.youtube.com/watch?v=abc",
+            requested_by="tester",
+        )
+        guild = SimpleNamespace(id=1)
+        sent: list[str] = []
+
+        cog._persist_queue_state = lambda *_a, **_k: asyncio.sleep(0)  # type: ignore[method-assign]
+        cog._start_next_if_needed = lambda *_a, **_k: asyncio.sleep(0)  # type: ignore[method-assign]
+        cog._send_channel = lambda _channel, message: asyncio.sleep(0, result=sent.append(str(message)))  # type: ignore[method-assign]
+
+        player.current = track
+        await cog._apply_track_finished_state(guild, player, SimpleNamespace(), playback_error=RuntimeError("ffmpeg 8"))
+        player.current = player.queue.get_nowait()
+        await cog._apply_track_finished_state(guild, player, SimpleNamespace(), playback_error=RuntimeError("ffmpeg 8"))
+
+        assert player.current is None
+        assert player.snapshot_queue() == []
+        assert len(sent) == 2
+
+    asyncio.run(_run())
+
+
 def test_resolver_spotify_fallback_prefers_best_candidate() -> None:
     class FakeMusic:
         async def extract_track(self, link: str, requester: str) -> Track:

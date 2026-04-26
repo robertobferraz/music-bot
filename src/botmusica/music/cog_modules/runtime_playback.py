@@ -178,7 +178,7 @@ class RuntimePlaybackMixin:
             voice_client.source.volume = normalized
 
     def _playback_retry_key(self, guild_id: int, track: Track) -> tuple[int, str]:
-        key_source = getattr(self.music, "_canonicalize_query_url", lambda value: value)(track.source_query)
+        key_source = getattr(self.music, "_canonicalize_query_url", lambda value: value)(track.webpage_url or track.source_query)
         return guild_id, f"{key_source}|{track.title}"
 
     def _consume_playback_error_retry(self, guild_id: int, track: Track) -> bool:
@@ -191,6 +191,28 @@ class RuntimePlaybackMixin:
 
     def _clear_playback_error_retry(self, guild_id: int, track: Track) -> None:
         self._playback_error_retries.pop(self._playback_retry_key(guild_id, track), None)
+
+    def _advance_track_source_after_playback_error(self, track: Track) -> bool:
+        candidates = self.music._candidate_source_queries(track)
+        if len(candidates) <= 1:
+            return False
+        current = self.music._canonicalize_query_url(track.source_query)
+        try:
+            current_index = candidates.index(current)
+        except ValueError:
+            current_index = 0
+        next_candidates = candidates[current_index + 1 :] or candidates[1:]
+        if not next_candidates:
+            return False
+        previous = track.source_query
+        track.source_query = next_candidates[0]
+        LOGGER.info(
+            "playback_error_retry_advance_source title=%s previous=%s next=%s",
+            track.title,
+            self.music._redact_url_for_log(previous),
+            self.music._redact_url_for_log(track.source_query),
+        )
+        return True
 
     async def _apply_track_finished_state(
         self,
@@ -215,6 +237,7 @@ class RuntimePlaybackMixin:
                 pass
 
         if playback_error and finished_track and self._consume_playback_error_retry(guild.id, finished_track):
+            self._advance_track_source_after_playback_error(finished_track)
             self.queue_service.enqueue_front(player, finished_track)
             await self._persist_queue_state(guild.id, player)
             self._set_player_state(guild.id, PlayerState.RECOVERING, reason="playback_error_retry")
@@ -230,6 +253,8 @@ class RuntimePlaybackMixin:
         if playback_error and text_channel:
             await self._send_channel(text_channel, self._error(f"Erro ao reproduzir audio: `{playback_error}`"))
             self._set_player_state(guild.id, PlayerState.ERROR, reason="playback_error")
+            if finished_track:
+                self._clear_playback_error_retry(guild.id, finished_track)
 
         if finished_track and not playback_error and not skip_postplay:
             self._clear_playback_error_retry(guild.id, finished_track)

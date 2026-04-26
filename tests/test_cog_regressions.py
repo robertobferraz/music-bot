@@ -158,6 +158,7 @@ def test_playback_error_requeues_track_once() -> None:
 
         assert player.current is None
         assert [item.title for item in player.snapshot_queue()] == ["track-a"]
+        assert player.snapshot_queue()[0].source_query.startswith("ytsearch5:")
         assert calls == {"persist": 1, "started": 1, "sent": 0}
 
     asyncio.run(_run())
@@ -188,6 +189,7 @@ def test_playback_error_retry_does_not_loop_forever() -> None:
         assert player.current is None
         assert player.snapshot_queue() == []
         assert len(sent) == 1
+        assert cog._playback_error_retries == {}
 
     asyncio.run(_run())
 

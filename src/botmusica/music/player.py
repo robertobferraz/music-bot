@@ -341,8 +341,15 @@ class MusicService:
         expires_at, stream_url, headers = cached
         if expires_at < time.monotonic():
             self._stream_url_cache.pop(source_query, None)
+            LOGGER.info("stream_cache expired query=%s", self._redact_url_for_log(source_query))
             return None
         self._stream_url_cache.move_to_end(source_query)
+        LOGGER.info(
+            "stream_cache hit query=%s stream=%s header_keys=%s",
+            self._redact_url_for_log(source_query),
+            self._redact_url_for_log(stream_url),
+            sorted(headers.keys()),
+        )
         return stream_url, headers
 
     def _cache_put_stream_url(self, source_query: str, stream_url: str, headers: dict[str, str] | None = None) -> None:
@@ -354,8 +361,30 @@ class MusicService:
             dict(headers or {}),
         )
         self._stream_url_cache.move_to_end(source_query)
+        LOGGER.info(
+            "stream_cache put query=%s stream=%s ttl=%ss header_keys=%s",
+            self._redact_url_for_log(source_query),
+            self._redact_url_for_log(stream_url),
+            self._stream_cache_ttl_seconds,
+            sorted((headers or {}).keys()),
+        )
         while len(self._stream_url_cache) > self._cache_max_entries:
             self._stream_url_cache.popitem(last=False)
+
+    @staticmethod
+    def _redact_url_for_log(value: str | None) -> str:
+        raw = (value or "").strip()
+        if not raw:
+            return ""
+        if "://" not in raw:
+            return raw[:180]
+        try:
+            parsed = urlparse(raw)
+        except ValueError:
+            return raw[:180]
+        query = "<query-redacted>" if parsed.query else ""
+        redacted = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", query, ""))
+        return redacted[:220]
 
     async def _extract_info_with_retry(self, ytdl: yt_dlp.YoutubeDL, query: str, *, cache_key: str) -> dict[str, Any]:
         cached_payload = self._cache_get_extract(cache_key)
@@ -772,6 +801,14 @@ class MusicService:
         options = f"{options} -af {','.join(filter_chain)}"
         return {"before_options": before_options, "options": options}
 
+    @staticmethod
+    def _ffmpeg_options_for_log(ffmpeg_options: dict[str, str]) -> dict[str, str]:
+        logged = dict(ffmpeg_options)
+        before_options = logged.get("before_options", "")
+        if "-headers" in before_options:
+            logged["before_options"] = "<contains-redacted-http-headers>"
+        return logged
+
     async def build_audio_source(
         self,
         track: Track,
@@ -781,6 +818,15 @@ class MusicService:
         start_seconds: int = 0,
     ) -> discord.AudioSource:
         source_queries = self._candidate_source_queries(track)
+        LOGGER.info(
+            "build_audio_source start title=%s artist=%s source_candidates=%s volume=%.2f filter=%s seek=%s",
+            track.title,
+            track.artist,
+            [self._redact_url_for_log(query) for query in source_queries],
+            volume,
+            audio_filter,
+            start_seconds,
+        )
         stream_url: str | None = None
         request_headers: dict[str, str] = {}
         last_error: Exception | None = None
@@ -803,8 +849,20 @@ class MusicService:
                     source_query,
                     cache_key=f"stream:{source_query}",
                 )
+                LOGGER.info(
+                    "build_audio_source extracted query=%s extractor=%s has_entries=%s has_formats=%s",
+                    self._redact_url_for_log(source_query),
+                    data.get("extractor"),
+                    isinstance(data.get("entries"), list),
+                    isinstance(data.get("formats"), list),
+                )
                 search_entry_queries = self._entry_source_queries_from_payload(data, source_query)
                 if search_entry_queries:
+                    LOGGER.info(
+                        "build_audio_source search entries title=%s entries=%s",
+                        track.title,
+                        [self._redact_url_for_log(query) for query in search_entry_queries[:5]],
+                    )
                     entry_error: Exception | None = None
                     for entry_query in search_entry_queries:
                         cached_entry_stream = self._cache_get_stream_url(entry_query)
@@ -818,6 +876,12 @@ class MusicService:
                                 self._ytdl,
                                 entry_query,
                                 cache_key=f"stream:{entry_query}",
+                            )
+                            LOGGER.info(
+                                "build_audio_source extracted entry=%s extractor=%s has_formats=%s",
+                                self._redact_url_for_log(entry_query),
+                                entry_data.get("extractor"),
+                                isinstance(entry_data.get("formats"), list),
                             )
                             data = self._extract_entry(entry_data)
                             source_query = entry_query
@@ -879,7 +943,21 @@ class MusicService:
             hq_audio_enabled=self._hq_audio_enabled,
             request_headers=request_headers,
         )
+        LOGGER.info(
+            "build_audio_source ffmpeg title=%s query=%s stream=%s options=%s header_keys=%s",
+            track.title,
+            self._redact_url_for_log(resolved_query),
+            self._redact_url_for_log(stream_url),
+            self._ffmpeg_options_for_log(ffmpeg_options),
+            sorted(request_headers.keys()),
+        )
         base_source = discord.FFmpegPCMAudio(stream_url, **ffmpeg_options)
+        process = getattr(base_source, "_process", None)
+        LOGGER.info(
+            "build_audio_source ffmpeg_spawned title=%s pid=%s",
+            track.title,
+            getattr(process, "pid", None),
+        )
         return discord.PCMVolumeTransformer(base_source, volume=volume)
 
     async def prefetch_stream_url(self, track: Track) -> None:

@@ -508,10 +508,25 @@ class PlayCommandsMixin:
         # e so tenta recover quando realmente ha fila pendente sem audio.
         async def post_play_guardrail() -> None:
             voice_client_after = guild.voice_client
+            LOGGER.info(
+                "post_play_guardrail scheduled guild=%s connected_now=%s playing_now=%s paused_now=%s",
+                guild.id,
+                self._is_voice_connected(voice_client_after),
+                self._is_voice_playing(voice_client_after),
+                self._is_voice_paused(voice_client_after),
+            )
             if not self._is_voice_connected(voice_client_after):
                 return
             await asyncio.sleep(2.5)
             voice_client_after = guild.voice_client
+            LOGGER.info(
+                "post_play_guardrail check guild=%s connected=%s usable=%s playing=%s paused=%s",
+                guild.id,
+                self._is_voice_connected(voice_client_after),
+                self._is_voice_session_usable(guild, voice_client_after) if voice_client_after is not None else False,
+                self._is_voice_playing(voice_client_after),
+                self._is_voice_paused(voice_client_after),
+            )
             if not self._is_voice_connected(voice_client_after):
                 return
             if self._is_voice_playing(voice_client_after) or self._is_voice_paused(voice_client_after):
@@ -520,6 +535,12 @@ class PlayCommandsMixin:
                 player_now = await self._get_player(guild.id)
             except Exception:
                 return
+            LOGGER.info(
+                "post_play_guardrail recover_candidate guild=%s current=%s queue_size=%s",
+                guild.id,
+                player_now.current.title if player_now.current else None,
+                len(player_now.snapshot_queue()),
+            )
             if player_now.current is None and player_now.queue.empty():
                 return
             try:

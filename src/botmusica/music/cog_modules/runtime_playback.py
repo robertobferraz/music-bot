@@ -319,17 +319,38 @@ class RuntimePlaybackMixin:
 
         user_channel = await self._require_user_voice_channel(interaction)
         if user_channel is None:
+            LOGGER.info("ensure_voice no_user_channel guild=%s", guild.id)
             return None
 
         existing = guild.voice_client
         # Nao forca reconnect agressivo quando o bot ja esta no canal.
         force_reconnect = guild.id in self._voice_reconnect_required
+        existing_connected = False
+        existing_usable = False
+        if existing is not None:
+            try:
+                existing_connected = self._is_voice_connected(existing)
+                existing_usable = self._is_voice_session_usable(guild, existing)
+            except Exception:
+                LOGGER.debug("Falha ao inspecionar sessao de voz existente guild %s", guild.id, exc_info=True)
+        LOGGER.info(
+            "ensure_voice start guild=%s user_channel=%s existing=%s existing_channel=%s "
+            "existing_connected=%s existing_usable=%s force_reconnect=%s",
+            guild.id,
+            getattr(user_channel, "id", None),
+            existing is not None,
+            getattr(getattr(existing, "channel", None), "id", None),
+            existing_connected,
+            existing_usable,
+            force_reconnect,
+        )
 
         # Se ja esta no mesmo canal do usuario e a sessao ainda esta sincronizada,
         # reaproveita a conexao. Depois de idle, o VoiceClient pode continuar
         # reportando is_connected() mesmo sem guild.me.voice consistente.
         if existing is not None and getattr(existing, "channel", None) == user_channel:
-            if self._is_voice_session_usable(guild, existing):
+            if existing_usable:
+                LOGGER.info("ensure_voice reuse_same_channel guild=%s channel=%s", guild.id, getattr(user_channel, "id", None))
                 self._clear_voice_reconnect_required(guild.id)
                 self._set_player_state(guild.id, PlayerState.IDLE, reason="voice_reused_same_channel")
                 try:
@@ -339,7 +360,14 @@ class RuntimePlaybackMixin:
                     LOGGER.debug("Falha ao atualizar mini painel (voice_reused) no guild %s", guild.id, exc_info=True)
                 return existing
 
-        if existing is not None and (force_reconnect or not self._is_voice_session_usable(guild, existing)):
+        if existing is not None and (force_reconnect or not existing_usable):
+            LOGGER.info(
+                "ensure_voice disconnect_stale guild=%s force_reconnect=%s existing_usable=%s channel=%s",
+                guild.id,
+                force_reconnect,
+                existing_usable,
+                getattr(getattr(existing, "channel", None), "id", None),
+            )
             try:
                 await existing.disconnect(force=True)
             except Exception:
@@ -348,6 +376,12 @@ class RuntimePlaybackMixin:
 
         if self._is_voice_session_usable(guild, existing):
             if existing.channel != user_channel:
+                LOGGER.info(
+                    "ensure_voice move_channel guild=%s from=%s to=%s",
+                    guild.id,
+                    getattr(getattr(existing, "channel", None), "id", None),
+                    getattr(user_channel, "id", None),
+                )
                 await existing.move_to(user_channel)
                 await self._wait_voice_state_sync(guild, user_channel)
             self._clear_voice_reconnect_required(guild.id)
@@ -357,6 +391,7 @@ class RuntimePlaybackMixin:
                 await self._upsert_voice_mini_panel(guild, target, reason="voice_connected")
             except Exception:
                 LOGGER.debug("Falha ao atualizar mini painel (voice_connected) no guild %s", guild.id, exc_info=True)
+            LOGGER.info("ensure_voice reuse_usable guild=%s channel=%s", guild.id, getattr(user_channel, "id", None))
             return existing
 
         self._set_player_state(guild.id, PlayerState.CONNECTING, reason="joining_voice")
@@ -374,6 +409,13 @@ class RuntimePlaybackMixin:
             await self._upsert_voice_mini_panel(guild, target, reason="voice_joined_ffmpeg")
         except Exception:
             LOGGER.debug("Falha ao atualizar mini painel (voice_joined_ffmpeg) no guild %s", guild.id, exc_info=True)
+        LOGGER.info(
+            "ensure_voice connected_new guild=%s channel=%s usable=%s connected=%s",
+            guild.id,
+            getattr(user_channel, "id", None),
+            self._is_voice_session_usable(guild, connected),
+            self._is_voice_connected(connected),
+        )
         return connected
 
     def _mark_track_ffmpeg_fallback(self, guild_id: int, track: Track) -> None:
@@ -471,12 +513,29 @@ class RuntimePlaybackMixin:
         text_channel: discord.abc.Messageable | None = None,
     ) -> None:
         voice_client = guild.voice_client
+        LOGGER.info(
+            "start_next enter guild=%s voice_present=%s connected=%s usable=%s playing=%s paused=%s text_channel=%s",
+            guild.id,
+            voice_client is not None,
+            self._is_voice_connected(voice_client),
+            self._is_voice_session_usable(guild, voice_client) if voice_client is not None else False,
+            self._is_voice_playing(voice_client),
+            self._is_voice_paused(voice_client),
+            getattr(text_channel, "id", None),
+        )
         if not self._is_voice_connected(voice_client):
+            LOGGER.info("start_next abort_disconnected guild=%s", guild.id)
             self._cancel_playback_watchdog(guild.id)
             self._set_player_state(guild.id, PlayerState.IDLE, reason="voice_disconnected")
             await self._clear_voice_mini_panel(guild.id)
             return
         if not self._is_voice_session_usable(guild, voice_client):
+            LOGGER.warning(
+                "start_next abort_unusable_voice guild=%s channel=%s me_voice_channel=%s",
+                guild.id,
+                getattr(getattr(voice_client, "channel", None), "id", None),
+                getattr(getattr(getattr(guild.me, "voice", None), "channel", None), "id", None) if getattr(guild, "me", None) else None,
+            )
             self._cancel_playback_watchdog(guild.id)
             self._set_player_state(guild.id, PlayerState.RECOVERING, reason="voice_session_unusable")
             self._mark_voice_reconnect_required(guild.id)
@@ -492,16 +551,29 @@ class RuntimePlaybackMixin:
         player = await self._get_player(guild.id)
         lock = self._get_lock(guild.id)
         async with lock:
+            LOGGER.info(
+                "start_next locked guild=%s current=%s queue_size=%s restored_pending=%s playing=%s paused=%s",
+                guild.id,
+                player.current.title if player.current else None,
+                len(player.snapshot_queue()),
+                player.restored_queue_pending_activation,
+                self._is_voice_playing(voice_client),
+                self._is_voice_paused(voice_client),
+            )
             if self._is_voice_playing(voice_client) or self._is_voice_paused(voice_client):
+                LOGGER.info("start_next skip_already_playing guild=%s", guild.id)
                 return
             if player.current is not None:
+                LOGGER.info("start_next skip_current_present guild=%s current=%s", guild.id, player.current.title)
                 return
             if player.restored_queue_pending_activation and text_channel is None:
                 self._set_player_state(guild.id, PlayerState.IDLE, reason="restored_queue_pending_activation")
+                LOGGER.info("start_next skip_restored_pending_without_channel guild=%s", guild.id)
                 return
             if player.restored_queue_pending_activation:
                 player.restored_queue_pending_activation = False
             if player.queue.empty():
+                LOGGER.info("start_next queue_empty guild=%s scheduling_idle_disconnect=%ss", guild.id, self.idle_disconnect_seconds)
                 self._cancel_playback_watchdog(guild.id)
                 self._set_player_state(guild.id, PlayerState.IDLE, reason="queue_empty")
                 self._voice_became_idle_at[guild.id] = time.monotonic()
@@ -523,10 +595,25 @@ class RuntimePlaybackMixin:
                 if refreshed is None or not self._is_voice_session_usable(guild, refreshed):
                     self._set_player_state(guild.id, PlayerState.RECOVERING, reason="idle_refresh_failed")
                     self._mark_voice_reconnect_required(guild.id)
+                    LOGGER.warning("start_next idle_refresh_failed guild=%s", guild.id)
                     return
                 voice_client = refreshed
+                LOGGER.info(
+                    "start_next idle_refresh_ok guild=%s channel=%s connected=%s usable=%s",
+                    guild.id,
+                    getattr(getattr(voice_client, "channel", None), "id", None),
+                    self._is_voice_connected(voice_client),
+                    self._is_voice_session_usable(guild, voice_client),
+                )
 
             track = await player.queue.get()
+            LOGGER.info(
+                "start_next dequeued guild=%s title=%s query=%s remaining=%s",
+                guild.id,
+                track.title,
+                getattr(self.music, "_redact_url_for_log", lambda value: str(value)[:180])(track.source_query),
+                len(player.snapshot_queue()),
+            )
             self._set_player_state(guild.id, PlayerState.BUFFERING, reason=f"buffering:{track.title[:48]}")
             player.current = track
             player.current_started_at = None
@@ -543,6 +630,15 @@ class RuntimePlaybackMixin:
                     volume=player.volume,
                     audio_filter=player.audio_filter,
                     start_seconds=seek_seconds,
+                )
+                original = getattr(source, "original", source)
+                process = getattr(original, "_process", None)
+                LOGGER.info(
+                    "start_next source_ready guild=%s title=%s source_type=%s ffmpeg_pid=%s",
+                    guild.id,
+                    track.title,
+                    type(source).__name__,
+                    getattr(process, "pid", None),
                 )
             except Exception as exc:
                 self._set_player_state(guild.id, PlayerState.ERROR, reason="stream_prepare_failed")
@@ -568,9 +664,24 @@ class RuntimePlaybackMixin:
             def after_playback(err: Exception | None) -> None:
                 nonlocal playback_error
                 playback_error = err
+                LOGGER.warning(
+                    "voice_after_callback guild=%s title=%s error=%r",
+                    guild.id,
+                    track.title,
+                    err,
+                )
                 self.bot.loop.call_soon_threadsafe(finished.set)
 
             try:
+                LOGGER.info(
+                    "voice_play_call guild=%s title=%s connected=%s usable=%s playing_before=%s paused_before=%s",
+                    guild.id,
+                    track.title,
+                    self._is_voice_connected(voice_client),
+                    self._is_voice_session_usable(guild, voice_client),
+                    self._is_voice_playing(voice_client),
+                    self._is_voice_paused(voice_client),
+                )
                 voice_client.play(source, after=after_playback)
             except Exception as exc:
                 self._set_player_state(guild.id, PlayerState.ERROR, reason="voice_play_failed")
@@ -590,14 +701,54 @@ class RuntimePlaybackMixin:
                 await self._start_next_if_needed(guild, text_channel)
                 return
             player.current_started_at = time.monotonic()
+            original = getattr(source, "original", source)
+            process = getattr(original, "_process", None)
+            LOGGER.info(
+                "voice_play_started guild=%s title=%s playing_after=%s paused_after=%s ffmpeg_pid=%s ffmpeg_returncode=%s",
+                guild.id,
+                track.title,
+                self._is_voice_playing(voice_client),
+                self._is_voice_paused(voice_client),
+                getattr(process, "pid", None),
+                process.poll() if process is not None else None,
+            )
             self._schedule_prefetch_next(guild.id, player)
             await self._upsert_nowplaying_message(guild, text_channel)
             self._schedule_nowplaying_updater(guild)
             self._schedule_playback_watchdog(guild, text_channel)
             self._set_player_state(guild.id, PlayerState.PLAYING, reason="ffmpeg_playing")
 
+            async def playback_probe() -> None:
+                await asyncio.sleep(2.0)
+                current_voice = guild.voice_client
+                current_player = await self._get_player(guild.id)
+                original_source = getattr(source, "original", source)
+                ffmpeg_process = getattr(original_source, "_process", None)
+                LOGGER.info(
+                    "voice_play_probe guild=%s title=%s connected=%s usable=%s playing=%s paused=%s "
+                    "current=%s queue_size=%s ffmpeg_pid=%s ffmpeg_returncode=%s",
+                    guild.id,
+                    track.title,
+                    self._is_voice_connected(current_voice),
+                    self._is_voice_session_usable(guild, current_voice) if current_voice is not None else False,
+                    self._is_voice_playing(current_voice),
+                    self._is_voice_paused(current_voice),
+                    current_player.current.title if current_player.current else None,
+                    len(current_player.snapshot_queue()),
+                    getattr(ffmpeg_process, "pid", None),
+                    ffmpeg_process.poll() if ffmpeg_process is not None else None,
+                )
+
+            self.bot.loop.create_task(playback_probe())
+
             async def wait_and_advance() -> None:
                 await finished.wait()
+                LOGGER.info(
+                    "voice_wait_finished guild=%s title=%s playback_error=%r",
+                    guild.id,
+                    track.title,
+                    playback_error,
+                )
                 await self._apply_track_finished_state(
                     guild,
                     player,

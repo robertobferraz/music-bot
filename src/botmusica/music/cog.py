@@ -171,6 +171,7 @@ class MusicCog(
         self._queue_event_flush_lock = asyncio.Lock()
         self._query_usage_flush_lock = asyncio.Lock()
         self._voice_reconnect_required: set[int] = set()
+        self._voice_became_idle_at: dict[int, float] = {}
         self._playback_watchdog_tasks: dict[int, asyncio.Task[None]] = {}
         self._control_room_state_cache: dict[int, tuple[int, int]] = {}
         self._control_room_operator: dict[int, int] = {}
@@ -180,6 +181,7 @@ class MusicCog(
         self._control_room_preset_cursor: dict[int, int] = {}
         self._voice_mini_panel_state: dict[int, tuple[int, int]] = {}
         self.idle_disconnect_seconds = int(getattr(bot, "idle_disconnect_seconds", 300))
+        self.voice_idle_reconnect_seconds = int(os.getenv("VOICE_IDLE_RECONNECT_SECONDS", "30").strip() or "30")
         self.max_queue_size = int(getattr(bot, "max_queue_size", 50))
         self.max_user_queue_items = int(getattr(bot, "max_user_queue_items", 0))
         self.max_playlist_import = int(getattr(bot, "max_playlist_import", 100))

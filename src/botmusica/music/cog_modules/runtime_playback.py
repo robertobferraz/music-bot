@@ -242,6 +242,11 @@ class RuntimePlaybackMixin:
                     await self._stop_voice(voice_client)
                 except Exception:
                     LOGGER.debug("Falha ao parar voz antes do idle disconnect guild %s", guild.id, exc_info=True)
+                if self._is_voice_playing(voice_client) or self._is_voice_paused(voice_client):
+                    return
+                player_recheck = await self._get_player(guild.id)
+                if player_recheck.current is not None or not player_recheck.queue.empty():
+                    return
                 self._mark_voice_reconnect_required(guild.id)
                 await voice_client.disconnect(force=True)
                 await self._clear_nowplaying_message(guild.id)
@@ -497,8 +502,27 @@ class RuntimePlaybackMixin:
             if player.queue.empty():
                 self._cancel_playback_watchdog(guild.id)
                 self._set_player_state(guild.id, PlayerState.IDLE, reason="queue_empty")
+                self._voice_became_idle_at[guild.id] = time.monotonic()
                 self._schedule_idle_disconnect(guild, text_channel)
                 return
+
+            idle_since = self._voice_became_idle_at.pop(guild.id, None)
+            if idle_since is not None and self.voice_idle_reconnect_seconds > 0 and (
+                time.monotonic() - idle_since
+            ) >= self.voice_idle_reconnect_seconds:
+                idle_duration = time.monotonic() - idle_since
+                LOGGER.info(
+                    "Voice session idle for %.1fs on guild %s — refreshing before playback.",
+                    idle_duration,
+                    guild.id,
+                )
+                self._log_event("voice_idle_refresh", guild=guild.id, idle_seconds=f"{idle_duration:.1f}")
+                refreshed = await self._force_voice_session_refresh(guild, voice_client)
+                if refreshed is None or not self._is_voice_session_usable(guild, refreshed):
+                    self._set_player_state(guild.id, PlayerState.RECOVERING, reason="idle_refresh_failed")
+                    self._mark_voice_reconnect_required(guild.id)
+                    return
+                voice_client = refreshed
 
             track = await player.queue.get()
             self._set_player_state(guild.id, PlayerState.BUFFERING, reason=f"buffering:{track.title[:48]}")

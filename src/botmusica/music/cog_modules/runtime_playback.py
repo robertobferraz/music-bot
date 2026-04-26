@@ -399,23 +399,27 @@ class RuntimePlaybackMixin:
         channel = getattr(voice_client, "channel", None) if voice_client is not None else None
         if not isinstance(channel, discord.VoiceChannel):
             return guild.voice_client
+        self._voice_refresh_in_progress.add(guild.id)
         try:
-            if self._is_voice_connected(voice_client):
-                try:
-                    await self._stop_voice(voice_client)
-                except Exception:
-                    LOGGER.debug("Falha ao parar voz antes do refresh no guild %s", guild.id, exc_info=True)
-                await voice_client.disconnect(force=True)
-        except Exception:
-            LOGGER.debug("Falha ao desconectar sessao atual no refresh guild %s", guild.id, exc_info=True)
-        await asyncio.sleep(0.2)
-        try:
-            refreshed = await channel.connect(self_deaf=True)
-            await self._wait_voice_state_sync(guild, channel, timeout_seconds=2.0)
-            return refreshed
-        except Exception:
-            LOGGER.debug("Falha ao recriar sessao de voz no refresh guild %s", guild.id, exc_info=True)
-            return guild.voice_client
+            try:
+                if self._is_voice_connected(voice_client):
+                    try:
+                        await self._stop_voice(voice_client)
+                    except Exception:
+                        LOGGER.debug("Falha ao parar voz antes do refresh no guild %s", guild.id, exc_info=True)
+                    await voice_client.disconnect(force=True)
+            except Exception:
+                LOGGER.debug("Falha ao desconectar sessao atual no refresh guild %s", guild.id, exc_info=True)
+            await asyncio.sleep(0.2)
+            try:
+                refreshed = await channel.connect(self_deaf=True)
+                await self._wait_voice_state_sync(guild, channel, timeout_seconds=2.0)
+                return refreshed
+            except Exception:
+                LOGGER.debug("Falha ao recriar sessao de voz no refresh guild %s", guild.id, exc_info=True)
+                return guild.voice_client
+        finally:
+            self._voice_refresh_in_progress.discard(guild.id)
 
     async def _recover_playback_after_reconnect(
         self,

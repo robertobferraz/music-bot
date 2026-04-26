@@ -172,6 +172,7 @@ class MusicCog(
         self._query_usage_flush_lock = asyncio.Lock()
         self._voice_reconnect_required: set[int] = set()
         self._voice_became_idle_at: dict[int, float] = {}
+        self._voice_refresh_in_progress: set[int] = set()
         self._playback_watchdog_tasks: dict[int, asyncio.Task[None]] = {}
         self._control_room_state_cache: dict[int, tuple[int, int]] = {}
         self._control_room_operator: dict[int, int] = {}

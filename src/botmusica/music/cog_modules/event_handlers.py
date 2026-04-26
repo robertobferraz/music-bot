@@ -24,7 +24,7 @@ class EventHandlersMixin:
         # Ignore the bot's own state changes for the alone-check logic.
         if member.id == self.bot.user.id:
             # If the bot was disconnected externally, clean up state.
-            if before.channel is not None and after.channel is None:
+            if before.channel is not None and after.channel is None and member.guild.id not in self._voice_refresh_in_progress:
                 guild = member.guild
                 player = await self._get_player(guild.id)
                 await self._persist_queue_state(guild.id, player)
